@@ -10,6 +10,7 @@ from pathlib import Path
 import tempfile
 import os
 import re
+import streamlit.components.v1 as components
 
 
 US_STATES_GEOJSON_URL = "https://raw.githubusercontent.com/PublicaMundi/MappingAPI/master/data/geojson/us-states.json"
@@ -165,30 +166,6 @@ def build_color_map_stable(all_bins: list) -> dict:
 
     # If more bins than palette, interpolate by repeating (or you can extend palette)
     return {b: palette[min(i, len(palette) - 1)] for i, b in enumerate(bins_sorted)}
-
-# def render_deck_png_from_html(html: str, width: int = 2400, height: int = 1600, scale: int = 2) -> bytes:
-#     """
-#     Render a pydeck HTML string into a high-res PNG (cached by html+settings).
-#     Requires Playwright installed + chromium installed.
-#     """
-#     from playwright.sync_api import sync_playwright
-
-#     with tempfile.TemporaryDirectory() as td:
-#         html_path = Path(td) / "map.html"
-#         html_path.write_text(html, encoding="utf-8")
-
-#         with sync_playwright() as p:
-#             browser = p.chromium.launch()
-#             page = browser.new_page(
-#                 viewport={"width": int(width), "height": int(height)},
-#                 device_scale_factor=int(scale),
-#             )
-#             page.goto(html_path.as_uri())
-#             page.wait_for_timeout(1500)  # allow tiles/layers to load
-#             png_bytes = page.screenshot(full_page=False)
-#             browser.close()
-
-#     return png_bytes
 
 def render_deck_png_from_html(
     html: str,
@@ -754,63 +731,89 @@ with left:
         map_style=map_style,
         map_provider="mapbox",
     )
-    st.pydeck_chart(deck, use_container_width=True)
+
 
     # -----------------------------
-    # One-click export (lazy render)
+    # Client-side export (no Playwright)
     # -----------------------------
-    EXPORT_W, EXPORT_H, EXPORT_SCALE = 1400, 800, 2
-
-    # Signature so we know when the map changed and the old export is stale
-    map_signature = (
-        zoom_region,
-        tuple(bins_selected),
-        agg_mode,
-        float(min_px), float(max_px),
-        float(fill_opacity),
-        int(outline_width),
-        bool(show_outlines),
-        bool(darken_states_overlay),
-        float(state_border_width),
-        float(state_border_opacity),
-        bool(show_state_labels),
-        float(state_label_size),
-        float(state_label_opacity),
-        base_style,   # include anything else that changes appearance
+    import streamlit.components.v1 as components  # put at top of file ideally
+    
+    export_scale = st.slider(
+        "Export quality multiplier",
+        1, 4, 2,
+        help="Higher = larger PNG. 2x is a good default."
     )
-
-    # If map changed, invalidate previously rendered PNG
-    if st.session_state.get("export_signature") != map_signature:
-        st.session_state["export_signature"] = map_signature
-        st.session_state["export_png"] = None
-
-    colA, colB = st.columns([1, 1])
-
-    with colA:
-        if st.button("🔄 Process high-res PNG file", key="render_png_btn"):
-            with st.spinner("Rendering high-res PNG..."):
-                deck_html = deck.to_html(as_string=True)
-                st.session_state["export_png"] = render_deck_png_from_html(
-                    deck_html, EXPORT_W, EXPORT_H, EXPORT_SCALE
-                )
-
-    with colB:
-        png_ready = st.session_state.get("export_png") is not None
-        st.download_button(
-            "⬇️ Download PNG",
-            data=st.session_state.get("export_png") or b"",
-            file_name="prospect_geo_map.png",
-            mime="image/png",
-            disabled=not png_ready,
-            key="download_png_btn",
-        )
-
-    if st.session_state.get("export_png") is None:
-        st.caption("Tip: Click **Render high-res PNG** once you’re happy with the map. Then download.")
-    else:
-        st.caption("✅ PNG is ready. If you tweak any settings, you’ll need to render again.")
-
-
+    
+    deck_html = deck.to_html(as_string=True)
+    
+    inject = f"""
+    <style>
+      body {{ margin: 0; }}
+      .export-bar {{
+        position: absolute;
+        z-index: 9999;
+        top: 10px;
+        left: 10px;
+        display: flex;
+        gap: 8px;
+        font-family: sans-serif;
+      }}
+      .export-btn {{
+        padding: 8px 10px;
+        border: 0;
+        border-radius: 8px;
+        background: #111;
+        color: #fff;
+        cursor: pointer;
+        font-size: 13px;
+      }}
+      .export-note {{
+        padding: 8px 10px;
+        border-radius: 8px;
+        background: rgba(255,255,255,0.9);
+        color: #111;
+        font-size: 12px;
+      }}
+    </style>
+    
+    <div class="export-bar">
+      <button class="export-btn" onclick="downloadPng()">⬇️ Download PNG</button>
+      <div class="export-note">Scale: {export_scale}x</div>
+    </div>
+    
+    <script>
+    function downloadPng() {{
+      // deck.gl draws to canvas; pick the largest visible canvas
+      const canvases = Array.from(document.querySelectorAll('canvas'));
+      if (!canvases.length) {{
+        alert('Canvas not found yet. Try again in a second.');
+        return;
+      }}
+      const canvas = canvases.sort((a,b) => (b.width*b.height) - (a.width*a.height))[0];
+    
+      const scale = {export_scale};
+    
+      // upscale onto an offscreen canvas
+      const out = document.createElement('canvas');
+      out.width = canvas.width * scale;
+      out.height = canvas.height * scale;
+      const ctx = out.getContext('2d');
+      ctx.setTransform(scale, 0, 0, scale, 0, 0);
+      ctx.drawImage(canvas, 0, 0);
+    
+      const a = document.createElement('a');
+      a.download = 'prospect_geo_map.png';
+      a.href = out.toDataURL('image/png');
+      a.click();
+    }}
+    </script>
+    """
+    
+    deck_html = deck_html.replace("</body>", inject + "\n</body>")
+    
+    # Show the map (and export button) inside an iframe
+    components.html(deck_html, height=700, scrolling=False)
+    
 
 with right:
     st.subheader("Top Regions (stacked by capacity bin)")
