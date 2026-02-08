@@ -745,6 +745,22 @@ with left:
     # Control map size (keeps layout consistent)
     MAP_H = 700  # tweak if you want taller
     deck_html = deck.to_html(as_string=True)
+
+    # --- Patch Mapbox GL initialization to preserve drawing buffer ---
+    deck_html = re.sub(
+        r"new mapboxgl\.Map\(\{",
+        "new mapboxgl.Map({preserveDrawingBuffer: true,",
+        deck_html,
+        count=1
+    )
+    
+    # --- Patch DeckGL initialization as well (covers overlay canvas) ---
+    deck_html = re.sub(
+        r"new deck\.DeckGL\(\{",
+        "new deck.DeckGL({parameters: {preserveDrawingBuffer: true},",
+        deck_html,
+        count=1
+    )
     
     inject = f"""
     <style>
@@ -797,46 +813,63 @@ with left:
     </div>
     
     <script>
-    async function downloadPng() {{
-      // Give deck/mapbox a moment to finish drawing
-      await new Promise(r => setTimeout(r, 800));
+    async function downloadPng() {
+      // wait for tiles and overlays to draw
+      await new Promise(r => setTimeout(r, 1200));
     
-      // Prefer the WebGL canvas (deck.gl)
+      const scale = {{EXPORT_SCALE}}; // we'll inject this from Python
+    
+      // Mapbox base canvas
+      const mapCanvas = document.querySelector('.mapboxgl-canvas');
+    
+      // Deck overlay canvas: choose the largest non-mapbox canvas
       const canvases = Array.from(document.querySelectorAll('canvas'));
-      if (!canvases.length) {{
-        alert('Canvas not found yet. Try again in a second.');
+      let deckCanvas = null;
+      if (canvases.length) {
+        deckCanvas = canvases
+          .filter(c => !c.classList.contains('mapboxgl-canvas'))
+          .sort((a,b) => (b.width*b.height) - (a.width*a.height))[0];
+      }
+    
+      if (!mapCanvas && !deckCanvas) {
+        alert("No canvases found yet. Try again in a second.");
         return;
-      }}
+      }
     
-      // Pick the largest canvas (usually the map)
-      const canvas = canvases.sort((a,b) => (b.width*b.height) - (a.width*a.height))[0];
+      // Prefer map dimensions; fallback to deck
+      const base = mapCanvas || deckCanvas;
     
-      const scale = {export_scale};
-    
-      // Offscreen upscale
+      // Output canvas (upscaled)
       const out = document.createElement('canvas');
-      out.width = canvas.width * scale;
-      out.height = canvas.height * scale;
+      out.width = base.width * scale;
+      out.height = base.height * scale;
     
       const ctx = out.getContext('2d');
-      ctx.setTransform(scale, 0, 0, scale, 0, 0);
-      ctx.drawImage(canvas, 0, 0);
     
-      // Use blob download (more reliable than dataURL for large images)
-      out.toBlob((blob) => {{
-        if (!blob) {{
-          alert("Export failed (blank/tainted canvas). Make sure preserveDrawingBuffer is enabled.");
+      // White background (avoids black default)
+      ctx.fillStyle = 'white';
+      ctx.fillRect(0, 0, out.width, out.height);
+    
+      // Draw both layers in the right order
+      ctx.setTransform(scale, 0, 0, scale, 0, 0);
+      if (mapCanvas) ctx.drawImage(mapCanvas, 0, 0);
+      if (deckCanvas) ctx.drawImage(deckCanvas, 0, 0);
+    
+      out.toBlob((blob) => {
+        if (!blob) {
+          alert("Export failed (canvas still not readable). preserveDrawingBuffer patch may not have applied.");
           return;
-        }}
+        }
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
         a.download = 'prospect_geo_map.png';
         a.click();
         URL.revokeObjectURL(url);
-      }}, 'image/png');
-    }}
+      }, 'image/png');
+    }
     </script>
+
     """
     
     deck_html = deck_html.replace("</body>", inject + "\n</body>")
