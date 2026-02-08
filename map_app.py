@@ -740,7 +740,7 @@ with left:
     # -----------------------------
 
     export_scale = st.slider("Export quality multiplier", 1, 4, 2)
-    MAP_H = 700
+    MAP_H = 600
     
     deck_html = deck.to_html(as_string=True)
     
@@ -751,7 +751,7 @@ with left:
     inject = f"""
     <style>
       html, body {{ margin:0; padding:0; background:white; }}
-      #deckgl-wrapper {{ width:100vw !important; height:100vh !important; }}
+      #deckgl-wrapper {{ width:100% !important; height:100% !important; }}
       .export-bar {{ position:absolute; z-index:9999; top:10px; left:10px; display:flex; gap:10px; font-family:sans-serif; }}
       .export-btn {{ padding:8px 12px; border:0; border-radius:10px; background:#111; color:#fff; cursor:pointer; }}
       .export-note {{ padding:8px 10px; border-radius:10px; background:rgba(255,255,255,0.92); border:1px solid rgba(0,0,0,0.08); }}
