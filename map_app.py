@@ -730,38 +730,52 @@ with left:
         tooltip=tooltip,
         map_style=map_style,
         map_provider="mapbox",
+        parameters={
+            "preserveDrawingBuffer": True  # ✅ critical for non-empty canvas exports
+        }
     )
 
 
     # -----------------------------
     # Client-side export (no Playwright)
     # -----------------------------
-    import streamlit.components.v1 as components  # put at top of file ideally
+
+    export_scale = st.slider("Export quality multiplier", 1, 4, 2)
     
-    export_scale = st.slider(
-        "Export quality multiplier",
-        1, 4, 2,
-        help="Higher = larger PNG. 2x is a good default."
-    )
-    
+    # Control map size (keeps layout consistent)
+    MAP_H = 700  # tweak if you want taller
     deck_html = deck.to_html(as_string=True)
     
     inject = f"""
     <style>
-      body {{ margin: 0; }}
+      html, body {{
+        margin: 0;
+        padding: 0;
+        background: white;
+      }}
+    
+      /* Force map to fill iframe */
+      #deckgl-wrapper {{
+        position: relative !important;
+        width: 100vw !important;
+        height: 100vh !important;
+        overflow: hidden !important;
+      }}
+    
       .export-bar {{
         position: absolute;
         z-index: 9999;
         top: 10px;
         left: 10px;
         display: flex;
-        gap: 8px;
+        gap: 10px;
         font-family: sans-serif;
+        align-items: center;
       }}
       .export-btn {{
-        padding: 8px 10px;
+        padding: 8px 12px;
         border: 0;
-        border-radius: 8px;
+        border-radius: 10px;
         background: #111;
         color: #fff;
         cursor: pointer;
@@ -769,10 +783,11 @@ with left:
       }}
       .export-note {{
         padding: 8px 10px;
-        border-radius: 8px;
-        background: rgba(255,255,255,0.9);
+        border-radius: 10px;
+        background: rgba(255,255,255,0.92);
         color: #111;
         font-size: 12px;
+        border: 1px solid rgba(0,0,0,0.08);
       }}
     </style>
     
@@ -782,38 +797,52 @@ with left:
     </div>
     
     <script>
-    function downloadPng() {{
-      // deck.gl draws to canvas; pick the largest visible canvas
+    async function downloadPng() {{
+      // Give deck/mapbox a moment to finish drawing
+      await new Promise(r => setTimeout(r, 800));
+    
+      // Prefer the WebGL canvas (deck.gl)
       const canvases = Array.from(document.querySelectorAll('canvas'));
       if (!canvases.length) {{
         alert('Canvas not found yet. Try again in a second.');
         return;
       }}
+    
+      // Pick the largest canvas (usually the map)
       const canvas = canvases.sort((a,b) => (b.width*b.height) - (a.width*a.height))[0];
     
       const scale = {export_scale};
     
-      // upscale onto an offscreen canvas
+      // Offscreen upscale
       const out = document.createElement('canvas');
       out.width = canvas.width * scale;
       out.height = canvas.height * scale;
+    
       const ctx = out.getContext('2d');
       ctx.setTransform(scale, 0, 0, scale, 0, 0);
       ctx.drawImage(canvas, 0, 0);
     
-      const a = document.createElement('a');
-      a.download = 'prospect_geo_map.png';
-      a.href = out.toDataURL('image/png');
-      a.click();
+      // Use blob download (more reliable than dataURL for large images)
+      out.toBlob((blob) => {{
+        if (!blob) {{
+          alert("Export failed (blank/tainted canvas). Make sure preserveDrawingBuffer is enabled.");
+          return;
+        }}
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'prospect_geo_map.png';
+        a.click();
+        URL.revokeObjectURL(url);
+      }}, 'image/png');
     }}
     </script>
     """
     
     deck_html = deck_html.replace("</body>", inject + "\n</body>")
     
-    # Show the map (and export button) inside an iframe
-    components.html(deck_html, height=700, scrolling=False)
-    
+    components.html(deck_html, height=MAP_H, scrolling=False)
+
 
 with right:
     st.subheader("Top Regions (stacked by capacity bin)")
