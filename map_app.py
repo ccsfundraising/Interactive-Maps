@@ -740,7 +740,7 @@ with left:
     # -----------------------------
 
     export_scale = st.slider("Export quality multiplier", 1, 4, 2)
-    MAP_H = 600
+    MAP_H = 500
     
     deck_html = deck.to_html(as_string=True)
     
