@@ -735,76 +735,26 @@ with left:
         }
     )
 
-
     # -----------------------------
     # Client-side export (no Playwright)
     # -----------------------------
 
     export_scale = st.slider("Export quality multiplier", 1, 4, 2)
+    MAP_H = 700
     
-    # Control map size (keeps layout consistent)
-    MAP_H = 700  # tweak if you want taller
     deck_html = deck.to_html(as_string=True)
-
-    # --- Patch Mapbox GL initialization to preserve drawing buffer ---
-    deck_html = re.sub(
-        r"new mapboxgl\.Map\(\{",
-        "new mapboxgl.Map({preserveDrawingBuffer: true,",
-        deck_html,
-        count=1
-    )
     
-    # --- Patch DeckGL initialization as well (covers overlay canvas) ---
-    deck_html = re.sub(
-        r"new deck\.DeckGL\(\{",
-        "new deck.DeckGL({parameters: {preserveDrawingBuffer: true},",
-        deck_html,
-        count=1
-    )
+    # Patch Mapbox + DeckGL to preserve drawing buffer
+    deck_html = re.sub(r"new mapboxgl\.Map\(\{", "new mapboxgl.Map({preserveDrawingBuffer: true,", deck_html, count=1)
+    deck_html = re.sub(r"new deck\.DeckGL\(\{", "new deck.DeckGL({parameters: {preserveDrawingBuffer: true},", deck_html, count=1)
     
     inject = f"""
     <style>
-      html, body {{
-        margin: 0;
-        padding: 0;
-        background: white;
-      }}
-    
-      /* Force map to fill iframe */
-      #deckgl-wrapper {{
-        position: relative !important;
-        width: 100vw !important;
-        height: 100vh !important;
-        overflow: hidden !important;
-      }}
-    
-      .export-bar {{
-        position: absolute;
-        z-index: 9999;
-        top: 10px;
-        left: 10px;
-        display: flex;
-        gap: 10px;
-        font-family: sans-serif;
-        align-items: center;
-      }}
-      .export-btn {{
-        padding: 8px 12px;
-        border: 0;
-        border-radius: 10px;
-        background: #111;
-        color: #fff;
-        cursor: pointer;
-        font-size: 13px;
-      }}
-      .export-note {{
-        padding: 8px 10px;
-        border-radius: 10px;
-        background: rgba(255,255,255,0.92);
-        color: #111;
-        font-size: 12px;
-        border: 1px solid rgba(0,0,0,0.08);
-      }}
+      html, body {{ margin:0; padding:0; background:white; }}
+      #deckgl-wrapper {{ width:100vw !important; height:100vh !important; }}
+      .export-bar {{ position:absolute; z-index:9999; top:10px; left:10px; display:flex; gap:10px; font-family:sans-serif; }}
+      .export-btn {{ padding:8px 12px; border:0; border-radius:10px; background:#111; color:#fff; cursor:pointer; }}
+      .export-note {{ padding:8px 10px; border-radius:10px; background:rgba(255,255,255,0.92); border:1px solid rgba(0,0,0,0.08); }}
     </style>
     
     <div class="export-bar">
@@ -813,67 +763,55 @@ with left:
     </div>
     
     <script>
-    async function downloadPng() {
-      // wait for tiles and overlays to draw
+    async function downloadPng() {{
       await new Promise(r => setTimeout(r, 1200));
+      const scale = {export_scale};
     
-      const scale = {{EXPORT_SCALE}}; // we'll inject this from Python
-    
-      // Mapbox base canvas
       const mapCanvas = document.querySelector('.mapboxgl-canvas');
-    
-      // Deck overlay canvas: choose the largest non-mapbox canvas
       const canvases = Array.from(document.querySelectorAll('canvas'));
       let deckCanvas = null;
-      if (canvases.length) {
+      if (canvases.length) {{
         deckCanvas = canvases
           .filter(c => !c.classList.contains('mapboxgl-canvas'))
           .sort((a,b) => (b.width*b.height) - (a.width*a.height))[0];
-      }
+      }}
     
-      if (!mapCanvas && !deckCanvas) {
+      if (!mapCanvas && !deckCanvas) {{
         alert("No canvases found yet. Try again in a second.");
         return;
-      }
+      }}
     
-      // Prefer map dimensions; fallback to deck
       const base = mapCanvas || deckCanvas;
     
-      // Output canvas (upscaled)
       const out = document.createElement('canvas');
       out.width = base.width * scale;
       out.height = base.height * scale;
-    
       const ctx = out.getContext('2d');
     
-      // White background (avoids black default)
       ctx.fillStyle = 'white';
       ctx.fillRect(0, 0, out.width, out.height);
     
-      // Draw both layers in the right order
       ctx.setTransform(scale, 0, 0, scale, 0, 0);
       if (mapCanvas) ctx.drawImage(mapCanvas, 0, 0);
       if (deckCanvas) ctx.drawImage(deckCanvas, 0, 0);
     
-      out.toBlob((blob) => {
-        if (!blob) {
-          alert("Export failed (canvas still not readable). preserveDrawingBuffer patch may not have applied.");
+      out.toBlob((blob) => {{
+        if (!blob) {{
+          alert("Export failed (canvas not readable).");
           return;
-        }
+        }}
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
         a.download = 'prospect_geo_map.png';
         a.click();
         URL.revokeObjectURL(url);
-      }, 'image/png');
-    }
+      }}, 'image/png');
+    }}
     </script>
-
     """
     
     deck_html = deck_html.replace("</body>", inject + "\n</body>")
-    
     components.html(deck_html, height=MAP_H, scrolling=False)
 
 
