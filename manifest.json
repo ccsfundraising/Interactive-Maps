@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "locale": "en_US.UTF-8",
+  "metadata": {
+    "appmode": "python-streamlit",
+    "entrypoint": "map_app.py"
+  },
+  "python": {
+    "version": "3.9.6",
+    "package_manager": {
+      "name": "pip",
+      "version": "26.0.1",
+      "package_file": "requirements.txt"
+    }
+  },
+  "files": {
+    "requirements.txt": {
+      "checksum": "75396c3e59d95742974b747c5c18a1fd"
+    },
+    ".gitignore": {
+      "checksum": "cefdd47a3388523f0a53ee40f396cc2f"
+    },
+    "LICENSE": {
+      "checksum": "d1699db72c28afd300982fd51bb05e66"
+    },
+    "map_app.py": {
+      "checksum": "4256ceeeaf13e54e5f466f20a15fb1cc"
+    }
+  }
+}
