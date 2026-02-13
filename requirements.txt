@@ -24,7 +24,7 @@ packaging==24.2
 pandas==2.2.1
 pgeocode==0.4.1
 pillow==11.3.0
-playwright==1.57.0
+playwright==1.58.0
 plotly==6.0.0
 protobuf==5.29.3
 pyarrow==21.0.0
