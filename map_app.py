@@ -14,7 +14,7 @@ import re
 
 US_STATES_GEOJSON_URL = "https://raw.githubusercontent.com/PublicaMundi/MappingAPI/master/data/geojson/us-states.json"
 
-st.set_page_config(page_title="Prospect Geo Maps", layout="wide")
+st.set_page_config(page_title="Interactive Geo Maps", layout="wide")
 st.title("Geographical Distribution Map Builder")
 
 # =========================================================
