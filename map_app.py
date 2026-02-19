@@ -563,7 +563,7 @@ if min_px >= max_px:
     )
 
 # Controls how much of the total radius range is used by the first 1..pivot IDs
-alpha = st.sidebar.slider("Small-ID emphasis", 0.01, 0.10, 0.01, step=0.01)
+alpha = st.sidebar.slider("Small-bubble emphasis", 0.01, 0.10, 0.01, step=0.01)
 pivot = st.sidebar.slider("Pivot # (slow growth after n=)", 1, 200, 5)
 k_post = st.sidebar.slider("Post-pivot saturation \n (damp big bubbles)", 50, 800, 50)
 
