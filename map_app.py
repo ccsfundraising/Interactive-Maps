@@ -1082,7 +1082,7 @@ if "p_state_filter" in st.session_state:
     st.session_state["p_state_filter"] = [
         s for s in st.session_state["p_state_filter"] if s in states
     ]
-state_filter = st.sidebar.multiselect("Filter states", states, default=[], key="p_state_filter")
+state_filter = st.sidebar.multiselect("Filter states", states, key="p_state_filter")
 if state_filter:
     df = df[df[state_col].astype(str).isin(state_filter)].copy()
 
@@ -1137,13 +1137,18 @@ else:
     st.session_state.pop("_applied_params_hash", None)
 
 # ✅ Use master bins for the multiselect so labels/colors stay stable
-# Sanitise any previously-loaded bins_selected against the current data
-if "p_bins_selected" in st.session_state:
+# Pre-seed session state so we never need default= on the widget (avoids the
+# "created with default but also set via Session State API" Streamlit warning).
+if "p_bins_selected" not in st.session_state:
+    # First run — select all bins by default
+    st.session_state["p_bins_selected"] = bins_master
+else:
+    # Sanitise any previously-loaded value against the current data
     st.session_state["p_bins_selected"] = [
         b for b in st.session_state["p_bins_selected"] if b in bins_master
     ]
 bins_selected = st.sidebar.multiselect(
-    "Capacity bins to show", bins_master, default=bins_master, key="p_bins_selected"
+    "Capacity bins to show", bins_master, key="p_bins_selected"
 )
 df = df[df["cap_bin"].isin(bins_selected)].copy()
 
