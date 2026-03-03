@@ -1175,10 +1175,11 @@ states_for_zoom = (
 
 st.sidebar.header("Aggregation")
 
+if "p_agg_mode" not in st.session_state:
+    st.session_state["p_agg_mode"] = "ZIP (zip5 + capacity bin)"
 agg_mode = st.sidebar.selectbox(
     "Map aggregation level",
     ["ZIP (zip5 + capacity bin)", "City (city + capacity bin)", "MSA (MSA + capacity bin)"],
-    index=0,  # ✅ default = ZIP
     key="p_agg_mode",
 )
 
@@ -1241,10 +1242,11 @@ df_agg_all = df_agg.copy()   # <-- keep full aggregated set for dropdown + camer
 
 st.sidebar.header("Basemap Settings")
 
+if "p_base_style" not in st.session_state:
+    st.session_state["p_base_style"] = "Light (Positron)"
 base_style = st.sidebar.radio(
     "Basemap style",
     ["Light (Positron)", "Light (Voyager)", "Dark"],
-    index=0,
     key="p_base_style",
 )
 
@@ -1258,35 +1260,47 @@ else:
 
 with st.sidebar.expander("🗺 Map Boundaries & Labels", expanded=False):
 
+    if "p_darken_states" not in st.session_state:
+        st.session_state["p_darken_states"] = True
     darken_states_overlay = st.checkbox(
-        "Darker state boundaries (overlay)", value=True, key="p_darken_states"
+        "Darker state boundaries (overlay)", key="p_darken_states"
     )
 
+    if "p_border_width" not in st.session_state:
+        st.session_state["p_border_width"] = 0.35
     state_border_width = st.slider(
         "State border thickness (px)",
-        0.1, 2.0, 0.35,
+        0.1, 2.0,
         step=0.25, key="p_border_width",
     )
 
+    if "p_border_opacity" not in st.session_state:
+        st.session_state["p_border_opacity"] = 0.1
     state_border_opacity = st.slider(
         "State border darkness",
-        0.01, 1.0, 0.1,
+        0.01, 1.0,
         step=0.05, key="p_border_opacity",
     )
 
+    if "p_show_labels" not in st.session_state:
+        st.session_state["p_show_labels"] = False
     show_state_labels = st.checkbox(
-        "Show state labels (overlay)", value=False, key="p_show_labels"
+        "Show state labels (overlay)", key="p_show_labels"
     )
 
+    if "p_label_size" not in st.session_state:
+        st.session_state["p_label_size"] = 0.8
     state_label_size = st.slider(
         "State label size (px)",
-        0.1, 10.0, 0.8,
+        0.1, 10.0,
         step=0.1, key="p_label_size",
     )
 
+    if "p_label_opacity" not in st.session_state:
+        st.session_state["p_label_opacity"] = 0.4
     state_label_opacity = st.slider(
         "State label opacity",
-        0.05, 1.0, 0.4,
+        0.05, 1.0,
         step=0.05, key="p_label_opacity",
     )
 
@@ -1295,12 +1309,20 @@ with st.sidebar.expander("🗺 Map Boundaries & Labels", expanded=False):
 # ---------------------------------------------------------
 st.sidebar.header("Bubble Settings")
 
-show_outlines    = st.sidebar.checkbox("Show bubble outlines", value=True, key="p_show_outlines")
-fill_opacity     = st.sidebar.slider("Bubble opacity", 0.05, 1.0, 0.20, step=0.05, key="p_fill_opacity")
-outline_width    = st.sidebar.slider("Bubble outline width (px)", 0, 6, 2, key="p_outline_width")
+if "p_show_outlines" not in st.session_state:
+    st.session_state["p_show_outlines"] = True
+show_outlines    = st.sidebar.checkbox("Show bubble outlines", key="p_show_outlines")
+if "p_fill_opacity" not in st.session_state:
+    st.session_state["p_fill_opacity"] = 0.20
+fill_opacity     = st.sidebar.slider("Bubble opacity", 0.05, 1.0, step=0.05, key="p_fill_opacity")
+if "p_outline_width" not in st.session_state:
+    st.session_state["p_outline_width"] = 2
+outline_width    = st.sidebar.slider("Bubble outline width (px)", 0, 6, key="p_outline_width")
 
 # optional declutter
-min_ids_to_show  = st.sidebar.slider("Hide groups with # of records < ", 1, 20, 1, key="p_min_ids")
+if "p_min_ids" not in st.session_state:
+    st.session_state["p_min_ids"] = 1
+min_ids_to_show  = st.sidebar.slider("Hide groups with # of records < ", 1, 20, key="p_min_ids")
 df_agg = df_agg[df_agg["n_ids"] >= min_ids_to_show].copy()
 
 # ---------------------------------------------------------
@@ -1308,7 +1330,9 @@ df_agg = df_agg[df_agg["n_ids"] >= min_ids_to_show].copy()
 # ---------------------------------------------------------
 st.sidebar.header("Zoom-in Settings")
 
-zoom_in_mode = st.sidebar.checkbox("Zoom in mode", value=False, key="p_zoom_in_mode")
+if "p_zoom_in_mode" not in st.session_state:
+    st.session_state["p_zoom_in_mode"] = False
+zoom_in_mode = st.sidebar.checkbox("Zoom in mode", key="p_zoom_in_mode")
 
 # When Zoom in mode is ON, force radii to minimum possible values
 if zoom_in_mode:
@@ -1318,20 +1342,30 @@ if zoom_in_mode:
     st.sidebar.slider("Min radius (px)", 0.0, 1.0, min_px, step=0.1, disabled=True)
     st.sidebar.slider("Max radius (px)", 1.0, 10.0, max_px, step=0.5, disabled=True)
 else:
-    min_px = st.sidebar.slider("Min radius (px)", 0.0, 1.0, 0.3, step=0.1, key="p_min_px")
+    if "p_min_px" not in st.session_state:
+        st.session_state["p_min_px"] = 0.3
+    min_px = st.sidebar.slider("Min radius (px)", 0.0, 1.0, step=0.1, key="p_min_px")
     # Clamp any loaded max_px to be above min_px before the slider renders
     if "p_max_px" in st.session_state:
         st.session_state["p_max_px"] = max(float(st.session_state["p_max_px"]), float(min_px) + 0.5)
+    else:
+        st.session_state["p_max_px"] = max(2.0, float(min_px) + 0.5)
     # Max radius lower bound is always at least min_px + one step above it
-    max_px = st.sidebar.slider("Max radius (px)", min_px + 0.5, 10.0, max(2.0, min_px + 0.5), step=0.5, key="p_max_px")
+    max_px = st.sidebar.slider("Max radius (px)", min_px + 0.5, 10.0, step=0.5, key="p_max_px")
 
 # Hard clamp: guarantee max_px is strictly greater than min_px at all times
 max_px = max(max_px, min_px + 0.1)
 
 # Controls how much of the total radius range is used by the first 1..pivot IDs
-alpha  = st.sidebar.slider("Small-ID emphasis", 0.01, 0.10, 0.01, step=0.01, key="p_alpha")
-pivot  = st.sidebar.slider("Pivot # (slow growth after n=)", 1, 200, 5, key="p_pivot")
-k_post = st.sidebar.slider("Post-pivot saturation \n (damp big bubbles)", 50, 800, 50, key="p_k_post")
+if "p_alpha" not in st.session_state:
+    st.session_state["p_alpha"] = 0.01
+alpha  = st.sidebar.slider("Small-ID emphasis", 0.01, 0.10, step=0.01, key="p_alpha")
+if "p_pivot" not in st.session_state:
+    st.session_state["p_pivot"] = 5
+pivot  = st.sidebar.slider("Pivot # (slow growth after n=)", 1, 200, key="p_pivot")
+if "p_k_post" not in st.session_state:
+    st.session_state["p_k_post"] = 50
+k_post = st.sidebar.slider("Post-pivot saturation \n (damp big bubbles)", 50, 800, key="p_k_post")
 
 # # Damping > 1 makes post-pivot growth even slower
 # gamma_post = st.sidebar.slider("Post-pivot damping (Impact Big Bubbles)", 1.0, 6.0, 1.0, step=0.25)
@@ -1689,7 +1723,9 @@ with left:
 
 with right:
     st.subheader("Top Regions (stacked by capacity bin)")
-    top_n = st.slider("How many regions", 5, 25, 10, key="p_top_n")
+    if "p_top_n" not in st.session_state:
+        st.session_state["p_top_n"] = 10
+    top_n = st.slider("How many regions", 5, 25, key="p_top_n")
 
     if "region" in df_agg.columns:
         ctab = (
