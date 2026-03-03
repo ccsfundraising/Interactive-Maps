@@ -10,8 +10,194 @@ from pathlib import Path
 import tempfile
 import os
 import re
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
 
 
+# ── Viewport capture: tiny local HTTP server + module-level state ─────────────
+# JS inside the pydeck iframe fires an image-beacon GET request to this server
+# whenever the user pans or zooms the interactive map.  Python reads the latest
+# captured viewport when "Process PNG" is clicked — no extra UI needed.
+
+@st.cache_resource
+def _get_vp_store() -> dict:
+    """
+    Returns a single mutable dict that persists for the lifetime of the
+    Streamlit process.  Unlike a plain module-level assignment (which is
+    reset to its initialiser on every script rerun), a cache_resource object
+    is created once and shared across all reruns and threads.
+
+    Values start as None.  They are set to real coordinates only when the
+    user actually pans/zooms the map (onViewStateChange beacon).  The export
+    code falls back to the Python-computed initial_view_state when None.
+    """
+    return {"lat": None, "lon": None, "zoom": None}
+
+
+@st.cache_resource
+def _get_hm_vp_store() -> dict:
+    """Separate viewport store for the Census Heat Map (key=hm beacons)."""
+    return {"lat": None, "lon": None, "zoom": None}
+
+# NOTE: do NOT call _get_vp_store() here at module level.
+# Calling any st.cache_resource function before st.set_page_config() raises
+# StreamlitSetPageConfigMustBeFirstCommandError.
+# We call _get_vp_store() only inside the page body (after set_page_config).
+
+
+class _VPHandler(BaseHTTPRequestHandler):
+    """
+    Handles GET /vp?lat=…&lon=…&z=… from the injected JS beacon.
+
+    Chrome's Private Network Access (PNA) policy blocks requests from
+    localhost:8501 → 127.0.0.1:PORT unless the server handles the CORS
+    OPTIONS preflight AND returns Access-Control-Allow-Private-Network: true.
+    """
+
+    def _cors(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Private-Network", "true")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "*")
+
+    def do_OPTIONS(self):
+        """CORS / PNA preflight – must succeed or Chrome blocks the real GET."""
+        self.send_response(204)
+        self._cors()
+        self.end_headers()
+
+    def do_GET(self):
+        try:
+            q     = parse_qs(urlparse(self.path).query)
+            key   = q.get("key", ["main"])[0]
+            store = _get_hm_vp_store() if key == "hm" else _get_vp_store()
+            store["lat"]  = float(q["lat"][0])
+            store["lon"]  = float(q["lon"][0])
+            store["zoom"] = float(q["z"][0])
+        except Exception:
+            pass
+        self.send_response(200)
+        self._cors()
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass  # suppress server log noise
+
+
+@st.cache_resource
+def _start_vp_server() -> int:
+    """Start the viewport-capture server once per process; return its port."""
+    import socket
+    s = socket.socket()
+    s.bind(("", 0))
+    port = s.getsockname()[1]
+    s.close()
+    server = HTTPServer(("127.0.0.1", port), _VPHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return port
+
+
+def _inject_vp_capture(html: str, port: int) -> str:
+    """
+    Reliably capture the interactive viewport by doing two things:
+
+    1. Inject a global _vp_send() helper into <head> that fires an
+       XMLHttpRequest to the local server whenever called.  XHR is used
+       instead of fetch/Image because it works in every iframe sandbox
+       configuration with zero CORS complexity.
+
+    2. Inject onViewStateChange DIRECTLY into the createDeck({...}) call
+       that pydeck emits in its <script> block.  This avoids the fragile
+       window.createDeck monkey-patch that ran before createDeck() was called
+       and silently failed when timing was off.  Because we're inserting the
+       key straight into the props literal, it is guaranteed to be present.
+
+    No "initial beacon" is fired on render — that would reset the stored
+    coordinates every time Streamlit reruns (e.g. on button click).  Instead
+    the store starts as None and is only written by real user pan/zoom events.
+    """
+    # ── Part 1: helper function in <head> ────────────────────────────────────
+    head_script = (
+        "\n<script>\n"
+        "var _vp_port=" + str(port) + ";\n"
+        "var _vp_timer;\n"
+        "function _vp_send(la,lo,z){\n"
+        "  clearTimeout(_vp_timer);\n"
+        "  _vp_timer=setTimeout(function(){\n"
+        "    try{\n"
+        "      var r=new XMLHttpRequest();\n"
+        "      r.open('GET','http://127.0.0.1:'+_vp_port+\n"
+        "        '/vp?lat='+la+'&lon='+lo+'&z='+z,true);\n"
+        "      r.send();\n"
+        "    }catch(e){}\n"
+        "  },300);\n"
+        "}\n"
+        "</script>\n"
+    )
+
+    # ── Part 2: handleEvent injected INTO the createDeck({ literal ──────────
+    # In deck.gl 9.0.x (@deck.gl/jupyter-widget), createDeck() does NOT accept
+    # onViewStateChange as a prop.  View-state changes are routed through a
+    # handleEvent(eventName, payload) callback.  The event name is
+    # "deck-view-state-change-event" and the payload IS the viewState object
+    # directly (latitude / longitude / zoom at top level).
+    #
+    # The wiring inside the bundle (Swe function):
+    #   onViewStateChange: ({viewState}) =>
+    #       handleEvent("deck-view-state-change-event", viewState)
+    # …but only when handleEvent is truthy — injecting it enables that wiring.
+    vc_prop = (
+        "handleEvent:function(evtName,data){"
+        "if(evtName==='deck-view-state-change-event'"
+        "&&data&&data.latitude!==undefined)"
+        "_vp_send(data.latitude,data.longitude,data.zoom);"
+        "},"
+    )
+
+    html = html.replace("</head>", head_script + "</head>", 1)
+    # Insert handleEvent as the first prop of the createDeck call
+    html = html.replace("const deckInstance = createDeck({",
+                        "const deckInstance = createDeck({" + vc_prop, 1)
+    return html
+
+
+def _inject_hm_vp_capture(html: str, port: int) -> str:
+    """
+    Same as _inject_vp_capture but sends key=hm so the beacon is routed to
+    _get_hm_vp_store() instead of the main map's _get_vp_store().
+    """
+    head_script = (
+        "\n<script>\n"
+        "var _vp_port=" + str(port) + ";\n"
+        "var _vp_timer;\n"
+        "function _vp_send(la,lo,z){\n"
+        "  clearTimeout(_vp_timer);\n"
+        "  _vp_timer=setTimeout(function(){\n"
+        "    try{\n"
+        "      var r=new XMLHttpRequest();\n"
+        "      r.open('GET','http://127.0.0.1:'+_vp_port+\n"
+        "        '/vp?key=hm&lat='+la+'&lon='+lo+'&z='+z,true);\n"
+        "      r.send();\n"
+        "    }catch(e){}\n"
+        "  },300);\n"
+        "}\n"
+        "</script>\n"
+    )
+    vc_prop = (
+        "handleEvent:function(evtName,data){"
+        "if(evtName==='deck-view-state-change-event'"
+        "&&data&&data.latitude!==undefined)"
+        "_vp_send(data.latitude,data.longitude,data.zoom);"
+        "},"
+    )
+    html = html.replace("</head>", head_script + "</head>", 1)
+    html = html.replace("const deckInstance = createDeck({",
+                        "const deckInstance = createDeck({" + vc_prop, 1)
+    return html
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 US_STATES_GEOJSON_URL = "https://raw.githubusercontent.com/PublicaMundi/MappingAPI/master/data/geojson/us-states.json"
 
 st.set_page_config(page_title="Prospect Geo Maps", layout="wide")
@@ -196,13 +382,8 @@ def render_deck_png_from_html(
     height: int = 700,
     scale: int = 2,
 ) -> bytes:
-    """
-    Render pydeck HTML -> PNG of ONLY the map container (not the full page).
-    Uses Playwright to screenshot the deck.gl element.
-    """
+    """Render a pydeck HTML string to a PNG using a headless Playwright browser."""
     from playwright.sync_api import sync_playwright
-    from pathlib import Path
-    import tempfile
 
     with tempfile.TemporaryDirectory() as td:
         html_path = Path(td) / "map.html"
@@ -214,7 +395,6 @@ def render_deck_png_from_html(
                 viewport={"width": int(width), "height": int(height)},
                 device_scale_factor=int(scale),
             )
-
             page.goto(html_path.as_uri())
             page.wait_for_timeout(1500)  # allow tiles/layers to load
 
@@ -224,21 +404,19 @@ def render_deck_png_from_html(
                 "div#deckgl-wrapper",
                 "div[data-testid='deckgl-wrapper']",
                 ".deckgl-wrapper",
-                "canvas",  # fallback (captures only the canvas)
+                "canvas",
             ]
-
             shot = None
             for sel in selectors:
                 loc = page.locator(sel)
                 if loc.count() > 0:
                     try:
                         loc.first.wait_for(state="visible", timeout=2000)
-                        shot = loc.first.screenshot()  # <-- element-only screenshot
+                        shot = loc.first.screenshot()
                         break
                     except Exception:
                         pass
 
-            # Last resort: full viewport (should rarely happen)
             if shot is None:
                 shot = page.screenshot(full_page=False)
 
@@ -270,6 +448,27 @@ def normalize_radii_meters(counts: pd.Series, min_m: float, max_m: float) -> pd.
 
     norm = (z - zmin) / (zmax - zmin)
     return min_m + norm * (max_m - min_m)
+
+@st.cache_data(show_spinner=False)
+def load_msa_mapping():
+    """
+    Load the bundled ZIP-to-MSA reference table (zip_to_msa.xlsx).
+    Columns: 'Zip Code', 'MSA'.  Returns ['zip5', 'msa'] or None.
+    """
+    path = Path(__file__).parent / "zip_to_msa.xlsx"
+    if not path.exists():
+        return None
+    raw = pd.read_excel(path, dtype=str)
+    raw.columns = raw.columns.str.strip()
+    zip_c = next((c for c in raw.columns if "zip" in c.lower()), None)
+    msa_c = next((c for c in raw.columns if "msa" in c.lower()), None)
+    if zip_c is None or msa_c is None:
+        return None
+    out = raw[[zip_c, msa_c]].copy().dropna()
+    out["zip5"] = out[zip_c].astype(str).str.strip().str.zfill(5)
+    out["msa"]  = out[msa_c].astype(str).str.strip()
+    return out[["zip5", "msa"]].drop_duplicates("zip5")
+
 
 @st.cache_data(show_spinner=False)
 def load_state_label_points(states_geojson: dict) -> pd.DataFrame:
@@ -332,13 +531,505 @@ def load_state_label_points(states_geojson: dict) -> pd.DataFrame:
 
 
 # =========================================================
+# Census Heat Map – helpers
+# =========================================================
+
+CENSUS_VARIABLES = {
+    "Median Household Income":        "Median Income",
+    "Income Per Household":           "IncomePerHousehold",
+    "Population":                     "Population",
+    "Average House Value":            "AverageHouseValue",
+    "Median Household Value":         "Median Household Value",
+    "Labor Participation Rate (%)":   "Labor Participation Rate",
+    "Median Age":                     "Median age",
+    "Owner-Occupied Housing (%)":     "Owner-occupied housing units Percent",
+    "Bachelor's Degree or Higher (%)":"Percent Population 25 years and over Percent bachelors degree or higher",
+    "High School Grad or Higher (%)": "Percent Population 25 years and over Percent high school graduate or higher",
+    "Less Than 9th Grade (%)":        "Percent Population 25 years and over Less than 9th grade",
+}
+
+
+@st.cache_data(show_spinner=False)
+def load_census_data():
+    """Load the bundled CensusData.xlsx; returns DataFrame or None."""
+    path = Path(__file__).parent / "CensusData.xlsx"
+    if not path.exists():
+        return None
+    df = pd.read_excel(path, dtype={"ZipCode5Digits": str})
+    df["zip5"] = df["ZipCode5Digits"].astype(str).str.strip().str.zfill(5)
+    df = df.loc[:, ~df.columns.str.startswith("Unnamed")]
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def load_zip_geojson_for_states(state_pairs: tuple):
+    """
+    Download and merge ZIP/ZCTA boundary GeoJSON from OpenDataDE GitHub.
+    state_pairs: tuple of (abbr, full_state_name) pairs, e.g. (("IL", "Illinois"),)
+    Filename pattern: {abbr_lower}_{name_lower_underscored}_zip_codes_geo.min.json
+    Returns a FeatureCollection dict or None on failure.
+    """
+    all_features = []
+    for abbr, full_name in state_pairs:
+        name_slug = full_name.lower().replace(" ", "_")
+        filename  = f"{abbr.lower()}_{name_slug}_zip_codes_geo.min.json"
+        url = (
+            "https://raw.githubusercontent.com/OpenDataDE/State-zip-code-GeoJSON"
+            f"/master/{filename}"
+        )
+        try:
+            r = requests.get(url, timeout=30)
+            r.raise_for_status()
+            all_features.extend(r.json().get("features", []))
+        except Exception:
+            pass
+    return {"type": "FeatureCollection", "features": all_features} if all_features else None
+
+
+def get_zip_from_props(props: dict) -> str:
+    """Extract a 5-digit ZIP/ZCTA code from GeoJSON feature properties."""
+    for key in ["ZCTA5CE10", "ZCTA5CE20", "ZCTA5", "ZIP_CODE", "zip", "ZIP5", "ZIPCODE", "postalCode"]:
+        val = props.get(key)
+        if val:
+            return str(val).strip().zfill(5)
+    return ""
+
+
+def _lerp(c1, c2, t):
+    """Linearly interpolate between two RGB triplets."""
+    return [int(c1[i] + (c2[i] - c1[i]) * t) for i in range(3)]
+
+
+def value_to_rgba(val: float, vmin: float, vmax: float, scale: str, opacity: float) -> list:
+    """Map a scalar value in [vmin, vmax] to an RGBA list for pydeck."""
+    t = float(np.clip((val - vmin) / (vmax - vmin), 0, 1)) if vmax > vmin else 0.5
+    a = int(opacity * 255)
+
+    stops2 = {
+        "blue_dark": ([210, 235, 255], [10,  50, 150]),
+        "warm":      ([255, 250, 200], [200,  30,  30]),
+        "purple":    ([240, 220, 255], [ 70,  10, 130]),
+        "orange":    ([255, 245, 200], [180,  60,   0]),
+    }
+    if scale in stops2:
+        c1, c2 = stops2[scale]
+        return _lerp(c1, c2, t) + [a]
+
+    # 3-stop diverging scales through a yellow mid-point
+    mid = [255, 230, 80]
+    if scale == "green_red":
+        c_lo, c_hi = [20, 150, 70], [200, 30, 30]
+    else:  # "red_green"
+        c_lo, c_hi = [200, 30, 30], [20, 150, 70]
+    rgb = _lerp(c_lo, mid, t * 2) if t < 0.5 else _lerp(mid, c_hi, (t - 0.5) * 2)
+    return rgb + [a]
+
+
+def fmt_census_val(val, var_label: str) -> str:
+    """Format a census value for tooltip/legend display."""
+    if val is None or (isinstance(val, float) and np.isnan(val)):
+        return "N/A"
+    if any(k in var_label for k in ("Income", "Value", "House")):
+        return f"${val:,.0f}"
+    if any(k in var_label for k in ("%", "Rate", "Higher", "Grade", "Occupied")):
+        return f"{val:.1f}%"
+    if "Age" in var_label:
+        return f"{val:.1f} yrs"
+    return f"{val:,.0f}"
+
+
+# =========================================================
+
+# =========================================================
+# Page tabs — Distribution Map  |  Census Heat Map
+# =========================================================
+_tab_dist, _tab_hm = st.tabs([
+    "📍 Distribution Map",
+    "📊 Census Heat Map",
+])
+
+# ── Render Tab 2 (Census Heat Map) first so it is always visible,
+# ── even when no file has been uploaded (Tab 1 may call st.stop()).
+_tab_hm.__enter__()
+
+# Census Demographics Heat Map
+# =========================================================
+st.header("📊 Census Demographics Heat Map")
+st.caption(
+    "Visualize demographic variables at the ZIP code level for any US state or metro area, "
+    "using the bundled CensusData.xlsx."
+)
+
+_df_census = load_census_data()
+
+if _df_census is None:
+    st.warning(
+        "CensusData.xlsx not found. Place it in the same directory as map_app.py to enable this feature."
+    )
+else:
+    _hm_left, _hm_right = st.columns([1, 2.8])
+
+    with _hm_left:
+        st.subheader("Settings")
+
+        # ── State selector ────────────────────────────────────────────────────
+        _all_states = sorted(STATE_ABBR.keys())
+        _def_state  = "Illinois" if "Illinois" in _all_states else _all_states[0]
+        hm_state    = st.selectbox("State", _all_states,
+                                   index=_all_states.index(_def_state), key="hm_state")
+        hm_abbr     = STATE_ABBR[hm_state]
+
+        # ── City / MSA filter (optional) ──────────────────────────────────────
+        _msa_lkp   = load_msa_mapping()
+        _msa_opts  = ["— All ZIPs in state —"]
+        if _msa_lkp is not None:
+            _state_msas = sorted({
+                m for m in _msa_lkp["msa"].dropna()
+                if f", {hm_abbr}" in str(m)
+            })
+            _msa_opts += _state_msas
+        hm_msa = st.selectbox("City / MSA (optional)", _msa_opts, key="hm_msa")
+
+        # ── Variable ──────────────────────────────────────────────────────────
+        hm_var_label = st.selectbox("Variable to map",
+                                    list(CENSUS_VARIABLES.keys()), key="hm_var")
+        hm_var_col   = CENSUS_VARIABLES[hm_var_label]
+
+        # ── Color scale ───────────────────────────────────────────────────────
+        hm_cscale = st.selectbox(
+            "Color scale",
+            [
+                "Blue (light→dark)",
+                "Warm (yellow→red)",
+                "Green→Yellow→Red",
+                "Red→Yellow→Green",
+                "Purple (light→dark)",
+                "Orange (light→dark)",
+            ],
+            key="hm_cscale",
+        )
+        _cscale_key = {
+            "Blue (light→dark)":   "blue_dark",
+            "Warm (yellow→red)":   "warm",
+            "Green→Yellow→Red":    "green_red",
+            "Red→Yellow→Green":    "red_green",
+            "Purple (light→dark)": "purple",
+            "Orange (light→dark)": "orange",
+        }[hm_cscale]
+
+        hm_opacity      = st.slider("ZIP fill opacity", 0.1, 1.0, 0.7, step=0.05, key="hm_opacity")
+        hm_border       = st.checkbox("Show ZIP borders", value=True, key="hm_border")
+        hm_show_labels  = st.checkbox("Show ZIP code labels", value=True, key="hm_show_labels")
+        hm_label_size   = st.slider("ZIP label font size", 50, 100, 70, step=1,
+                                    key="hm_label_size",
+                                    disabled=not hm_show_labels)
+
+        with st.expander("Advanced (percentile clip)"):
+            hm_p_lo = st.slider("Clip low %ile",  0,  20,  2, key="hm_p_lo")
+            hm_p_hi = st.slider("Clip high %ile", 80, 100, 98, key="hm_p_hi")
+
+        hm_basemap = st.radio("Basemap", ["Light", "Dark"],
+                              horizontal=True, key="hm_basemap")
+        _hm_style  = (
+            "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json"
+            if hm_basemap == "Light"
+            else "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json"
+        )
+
+        _gen_hm = st.button("🗺 Generate Heat Map", type="primary", key="gen_hm")
+
+    # ── Right column: map output ──────────────────────────────────────────────
+    with _hm_right:
+        # Auto-regenerate when "data" settings (variable, state, MSA, color scale)
+        # change — GeoJSON is cached so only the color pass re-runs (fast).
+        # Continuous sliders (opacity, font size) stay live without full regen.
+        _hp_cur = st.session_state.get("hm_params")
+        _auto_regen = _hp_cur is not None and (
+            _hp_cur.get("var_col")  != hm_var_col  or
+            _hp_cur.get("abbr")     != hm_abbr      or
+            _hp_cur.get("msa")      != hm_msa       or
+            _hp_cur.get("cscale")   != _cscale_key  or
+            _hp_cur.get("p_lo")     != hm_p_lo      or
+            _hp_cur.get("p_hi")     != hm_p_hi
+        )
+        if _gen_hm or _auto_regen:
+            st.session_state["hm_params"] = dict(
+                state=hm_state, abbr=hm_abbr, msa=hm_msa,
+                var_col=hm_var_col, var_label=hm_var_label,
+                cscale=_cscale_key, opacity=hm_opacity,
+                border=hm_border, show_labels=hm_show_labels,
+                label_size=hm_label_size,
+                p_lo=hm_p_lo, p_hi=hm_p_hi,
+                style=_hm_style,
+            )
+
+        _hp = st.session_state.get("hm_params")
+
+        if _hp is None:
+            st.info("Configure settings on the left and click **Generate Heat Map**.")
+        else:
+            with st.spinner(f"Loading ZIP boundary data for {_hp['state']}…"):
+                _gj = load_zip_geojson_for_states(((_hp["abbr"], _hp["state"]),))
+
+            if _gj is None:
+                st.error(
+                    f"Could not load ZIP boundary data for {_hp['state']}. "
+                    "Check your internet connection."
+                )
+            else:
+                # ── Collect ZIP codes present in the GeoJSON ──────────────────
+                _gj_zips = set()
+                for _f in _gj["features"]:
+                    _z = get_zip_from_props(_f.get("properties", {}) or {})
+                    if _z:
+                        _gj_zips.add(_z)
+
+                # ── Filter census data to this state ──────────────────────────
+                _df_st = _df_census[_df_census["zip5"].isin(_gj_zips)].copy()
+
+                # ── Optionally narrow to selected MSA ─────────────────────────
+                _active_zips = _gj_zips
+                if _hp["msa"] != "— All ZIPs in state —" and _msa_lkp is not None:
+                    _mz = set(_msa_lkp[_msa_lkp["msa"] == _hp["msa"]]["zip5"].tolist())
+                    _active_zips = _gj_zips & _mz
+                    _df_st = _df_st[_df_st["zip5"].isin(_active_zips)].copy()
+
+                _vc = _hp["var_col"]
+                if _vc not in _df_st.columns:
+                    st.error(f"Column '{_vc}' not found in CensusData.xlsx.")
+                elif _df_st.empty or _df_st[_vc].replace(0, np.nan).dropna().empty:
+                    st.warning("No census data found for the selected area and variable.")
+                else:
+                    # ── Value range (winsorized) ──────────────────────────────
+                    _valid = _df_st[_vc].replace(0, np.nan).dropna()
+                    _vmin  = float(_valid.quantile(_hp["p_lo"] / 100))
+                    _vmax  = float(_valid.quantile(_hp["p_hi"] / 100))
+
+                    _zip_val = {
+                        row["zip5"]: float(row[_vc])
+                        for _, row in _df_st.iterrows()
+                        if pd.notna(row[_vc]) and row[_vc] != 0
+                    }
+
+                    # ── Enrich GeoJSON features with color + display value ─────
+                    # NOTE: avoid leading-underscore property names — pydeck's
+                    # tooltip template engine does not interpolate them correctly.
+                    _feats_out = []
+                    for _f in _gj["features"]:
+                        _props = dict(_f.get("properties", {}) or {})
+                        _z     = get_zip_from_props(_props)
+                        if _z not in _active_zips:
+                            continue
+                        _v = _zip_val.get(_z)
+                        if _v is not None:
+                            _props["fill_color"] = value_to_rgba(_v, _vmin, _vmax,
+                                                                  _hp["cscale"], _hp["opacity"])
+                            _props["value_str"]  = fmt_census_val(_v, _hp["var_label"])
+                        else:
+                            _props["fill_color"] = [200, 200, 200, 50]
+                            _props["value_str"]  = "N/A"
+                        _props["line_color"] = [60, 60, 60, 180] if _hp["border"] else [0, 0, 0, 0]
+                        _props["zip_code"]   = _z
+                        _feats_out.append({
+                            "type":       "Feature",
+                            "geometry":   _f["geometry"],
+                            "properties": _props,
+                        })
+
+                    _gj_out = {"type": "FeatureCollection", "features": _feats_out}
+
+                    # ── Map center & zoom ─────────────────────────────────────
+                    _lat_s = _df_st["Latitude"].dropna()
+                    _lon_s = _df_st["Longitude"].dropna()
+                    if not _lat_s.empty:
+                        _clat  = float(_lat_s.mean())
+                        _clon  = float(_lon_s.mean())
+                        _span  = max(float(_lat_s.max() - _lat_s.min()),
+                                     float(_lon_s.max() - _lon_s.min()))
+                        _czoom = (10.5 if _span < 0.3
+                                  else 9.0 if _span < 0.8
+                                  else 8.0 if _span < 2.0
+                                  else 7.0 if _span < 4.0
+                                  else 6.0 if _span < 8.0
+                                  else 5.0)
+                    else:
+                        _clat, _clon, _czoom = 39.5, -98.35, 4.0
+
+                    # ── pydeck GeoJsonLayer ───────────────────────────────────
+                    _hm_layer = pdk.Layer(
+                        "GeoJsonLayer",
+                        data=_gj_out,
+                        stroked=True,
+                        filled=True,
+                        get_fill_color="properties.fill_color",
+                        get_line_color="properties.line_color",
+                        line_width_min_pixels=0.5,
+                        pickable=True,
+                        auto_highlight=True,
+                    )
+
+                    # ── ZIP label TextLayer (uses census centroids) ───────────
+                    _label_df = (
+                        _df_st[_df_st["zip5"].isin(_active_zips)]
+                        [["zip5", "Latitude", "Longitude"]]
+                        .dropna(subset=["Latitude", "Longitude"])
+                        .rename(columns={"Latitude": "lat", "Longitude": "lon"})
+                        .reset_index(drop=True)
+                    )
+                    # Read display params directly from session state for live updates.
+                    _lsz         = int(st.session_state.get("hm_label_size", _hp.get("label_size", 16)))
+                    _show_labels = st.session_state.get("hm_show_labels", _hp.get("show_labels", True))
+
+                    # Use size_units="meters" so labels scale with zoom automatically:
+                    #   - at state zoom (5-7): labels ≈ 1-4px → invisible (below size_min_pixels)
+                    #   - at city zoom (8-9):  labels grow to size_min_pixels → size_max_pixels
+                    #   - fully zoomed in:     labels capped at size_max_pixels (= user's slider)
+                    # This naturally prevents the black blob without collision detection.
+                    _zip_label_layer = pdk.Layer(
+                        "TextLayer",
+                        data=_label_df,
+                        get_position="[lon, lat]",
+                        get_text="zip5",
+                        get_size=4000,           # nominal 4 km → invisible at state zoom
+                        size_units="meters",
+                        size_min_pixels=8,       # appear only when zoomed in enough
+                        size_max_pixels=_lsz,    # slider controls the max rendered size
+                        get_color=[15, 15, 15, 230],
+                        get_outline_color=[255, 255, 255, 220],
+                        outline_width=2,
+                        font_weight="bold",
+                        billboard=False,
+                        pickable=False,
+                    )
+
+                    _hm_layers = [_hm_layer]
+                    if _show_labels:
+                        _hm_layers.append(_zip_label_layer)
+
+                    _hm_deck = pdk.Deck(
+                        layers=_hm_layers,
+                        initial_view_state=pdk.ViewState(
+                            latitude=_clat, longitude=_clon, zoom=_czoom,
+                        ),
+                        tooltip={
+                            "html": (
+                                "<div style='font-family:sans-serif;padding:4px'>"
+                                "<b>ZIP {zip_code}</b><br/>"
+                                "<b>" + _hp["var_label"] + ":</b> {value_str}"
+                                "</div>"
+                            ),
+                            "style": {"backgroundColor": "white", "color": "black"},
+                        },
+                        map_style=_hp["style"],
+                    )
+
+                    _area_title = (
+                        _hp["msa"] if _hp["msa"] != "— All ZIPs in state —"
+                        else _hp["state"]
+                    )
+                    st.subheader(f"{_hp['var_label']} — {_area_title}")
+                    # Render via injected HTML so pan/zoom fires viewport beacons
+                    # (key=hm) → _get_hm_vp_store(), used by the PNG export below.
+                    _hm_vp_port  = _start_vp_server()
+                    _hm_disp_html = _hm_deck.to_html(as_string=True)
+                    _hm_disp_html = _inject_hm_vp_capture(_hm_disp_html, _hm_vp_port)
+                    st.components.v1.html(_hm_disp_html, height=520, scrolling=False)
+
+                    # ── Color legend bar ──────────────────────────────────────
+                    _N = 7
+                    _legend_html = (
+                        "<div style='display:flex;align-items:center;gap:4px;margin:6px 0 2px'>"
+                        f"<span style='font-size:11px;white-space:nowrap'>"
+                        f"{fmt_census_val(_vmin, _hp['var_label'])}</span>"
+                    )
+                    for _i in range(_N):
+                        _t  = _i / (_N - 1)
+                        _vi = _vmin + _t * (_vmax - _vmin)
+                        _ci = value_to_rgba(_vi, _vmin, _vmax, _hp["cscale"], 1.0)
+                        _legend_html += (
+                            f"<div style='flex:1;height:16px;"
+                            f"background:rgb({_ci[0]},{_ci[1]},{_ci[2]});"
+                            f"border-radius:2px'></div>"
+                        )
+                    _legend_html += (
+                        f"<span style='font-size:11px;white-space:nowrap'>"
+                        f"{fmt_census_val(_vmax, _hp['var_label'])}</span>"
+                        "</div>"
+                    )
+                    st.markdown(_legend_html, unsafe_allow_html=True)
+                    st.caption(
+                        f"Gray = no census data | "
+                        f"Clipped to {_hp['p_lo']}–{_hp['p_hi']}th percentile | "
+                        f"{len(_feats_out):,} ZIP codes rendered"
+                    )
+
+                    # ── PNG export (same Playwright pipeline as main map) ─────
+                    _safe_area = _area_title.replace(" ", "_").replace(",", "").replace("/", "-")
+                    _safe_var  = (_hp["var_label"]
+                                  .replace(" ", "_").replace("(", "").replace(")", "")
+                                  .replace("%", "pct").replace("'", ""))
+                    _dl_stem   = f"census_heatmap_{_safe_area}_{_safe_var}"
+
+                    # Invalidate cached PNG whenever the map parameters change
+                    _hm_sig = (
+                        _hp["abbr"], _hp["msa"], _hp["var_col"], _hp["cscale"],
+                        _hp["opacity"], _hp["border"], _hp["p_lo"], _hp["p_hi"], _hp["style"],
+                    )
+                    if st.session_state.get("hm_export_sig") != _hm_sig:
+                        st.session_state["hm_export_sig"] = _hm_sig
+                        st.session_state["hm_export_png"] = None
+
+                    _exp_col1, _exp_col2 = st.columns(2)
+                    with _exp_col1:
+                        if st.button("🔄 Render PNG", key="hm_render_png",
+                                     use_container_width=True):
+                            with st.spinner("Rendering high-res PNG…"):
+                                # Use whatever viewport the user currently has on screen.
+                                # Falls back to the Python-computed initial view if the
+                                # user hasn't panned/zoomed yet.
+                                _hm_vp   = _get_hm_vp_store()
+                                _exp_lat  = _hm_vp["lat"]  if _hm_vp["lat"]  is not None else _clat
+                                _exp_lon  = _hm_vp["lon"]  if _hm_vp["lon"]  is not None else _clon
+                                _exp_zoom = _hm_vp["zoom"] if _hm_vp["zoom"] is not None else _czoom
+                                # +1.0 compensates for export canvas (~2×) vs widget width
+                                _deck_exp = pdk.Deck(
+                                    layers=_hm_layers,
+                                    initial_view_state=pdk.ViewState(
+                                        latitude=_exp_lat,
+                                        longitude=_exp_lon,
+                                        zoom=_exp_zoom + 1.0,
+                                    ),
+                                    map_style=_hp["style"],
+                                )
+                                st.session_state["hm_export_png"] = render_deck_png_from_html(
+                                    _deck_exp.to_html(as_string=True), 1400, 800, 2
+                                )
+                    with _exp_col2:
+                        _hm_png_ready = st.session_state.get("hm_export_png") is not None
+                        st.download_button(
+                            "⬇️ Download PNG",
+                            data=st.session_state.get("hm_export_png") or b"",
+                            file_name=f"{_dl_stem}.png",
+                            mime="image/png",
+                            disabled=not _hm_png_ready,
+                            key="hm_download_png",
+                            use_container_width=True,
+                        )
+                    if not _hm_png_ready:
+                        st.caption("Click **Render PNG** once you're happy with the map, then download.")
+
+_tab_hm.__exit__(None, None, None)
+
+# ── Distribution Map tab ─────────────────────────────────────────────────
+_tab_dist.__enter__()
+
 # Upload + Load
 # =========================================================
 uploaded = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
 if not uploaded:
     st.info("Upload an Excel file to begin.")
+    _tab_dist.__exit__(None, None, None)
     st.stop()
-
 sheets = load_excel(uploaded)
 sheet_name = st.selectbox("Select sheet", list(sheets.keys()))
 df_raw = sheets[sheet_name].copy()
@@ -386,7 +1077,12 @@ color_map = build_color_map_stable(bins_master)
 # =========================================================
 st.sidebar.header("Filters")
 states = sorted(df[state_col].dropna().astype(str).unique().tolist())
-state_filter = st.sidebar.multiselect("Filter states", states, default=[])
+# Sanitise any previously-loaded state_filter against the current data
+if "p_state_filter" in st.session_state:
+    st.session_state["p_state_filter"] = [
+        s for s in st.session_state["p_state_filter"] if s in states
+    ]
+state_filter = st.sidebar.multiselect("Filter states", states, default=[], key="p_state_filter")
 if state_filter:
     df = df[df[state_col].astype(str).isin(state_filter)].copy()
 
@@ -396,8 +1092,59 @@ bins_master = sorted(df["cap_bin"].dropna().unique().tolist(), key=parse_capacit
 # ✅ Permanent colors tied to bins_master ONLY
 color_map = build_color_map_stable(bins_master)
 
+# ── Apply settings loaded from a params JSON file ────────────────────────────
+# Both `states` and `bins_master` are now known, so multiselect params can be
+# validated here. We use the widget key "params_file_uploader" (set by Streamlit
+# before the rerun starts) so this works even though the widget renders later.
+_pfile = st.session_state.get("params_file_uploader")
+if _pfile is not None:
+    try:
+        _pfile.seek(0)
+        _raw_bytes = _pfile.read()
+        _phash = hash(_raw_bytes)
+        if st.session_state.get("_applied_params_hash") != _phash:
+            _lp = json.loads(_raw_bytes).get("params", {})
+            # --- simple (non-data-dependent) params ---
+            for _k in [
+                "p_agg_mode", "p_base_style",
+                "p_darken_states", "p_border_width", "p_border_opacity",
+                "p_show_labels", "p_label_size", "p_label_opacity",
+                "p_show_outlines", "p_fill_opacity", "p_outline_width",
+                "p_min_ids", "p_zoom_in_mode", "p_min_px",
+                "p_alpha", "p_pivot", "p_k_post", "p_top_n",
+            ]:
+                if _k in _lp:
+                    st.session_state[_k] = _lp[_k]
+            # p_max_px: must be ≥ p_min_px + 0.5
+            if "p_max_px" in _lp:
+                _min_v = float(st.session_state.get("p_min_px", 0.3))
+                st.session_state["p_max_px"] = max(float(_lp["p_max_px"]), _min_v + 0.5)
+            # multiselects: validate against current data options
+            if "p_state_filter" in _lp:
+                st.session_state["p_state_filter"] = [
+                    s for s in _lp["p_state_filter"] if s in states
+                ]
+            if "p_bins_selected" in _lp:
+                st.session_state["p_bins_selected"] = [
+                    b for b in _lp["p_bins_selected"] if b in bins_master
+                ]
+            st.session_state["_applied_params_hash"] = _phash
+            st.rerun()
+    except Exception:
+        pass
+else:
+    # File removed — reset hash so re-uploading the same file works
+    st.session_state.pop("_applied_params_hash", None)
+
 # ✅ Use master bins for the multiselect so labels/colors stay stable
-bins_selected = st.sidebar.multiselect("Capacity bins to show", bins_master, default=bins_master)
+# Sanitise any previously-loaded bins_selected against the current data
+if "p_bins_selected" in st.session_state:
+    st.session_state["p_bins_selected"] = [
+        b for b in st.session_state["p_bins_selected"] if b in bins_master
+    ]
+bins_selected = st.sidebar.multiselect(
+    "Capacity bins to show", bins_master, default=bins_master, key="p_bins_selected"
+)
 df = df[df["cap_bin"].isin(bins_selected)].copy()
 
 # ✅ Display order is just the master order filtered down
@@ -425,14 +1172,36 @@ st.sidebar.header("Aggregation")
 
 agg_mode = st.sidebar.selectbox(
     "Map aggregation level",
-    ["ZIP (zip5 + capacity bin)", "City (city + capacity bin)"],
-    index=0  # ✅ default = ZIP
+    ["ZIP (zip5 + capacity bin)", "City (city + capacity bin)", "MSA (MSA + capacity bin)"],
+    index=0,  # ✅ default = ZIP
+    key="p_agg_mode",
 )
+
+# Load bundled ZIP→MSA reference table once (cached)
+df_zip_msa = load_msa_mapping()
 
 if agg_mode.startswith("ZIP"):
     group_cols = ["zip5", "lat", "lon", "region", "cap_bin"]
+
+elif agg_mode.startswith("MSA") and df_zip_msa is not None:
+    # Merge zip -> MSA, override region with MSA name
+    df = df.merge(df_zip_msa, on="zip5", how="left")
+    df["msa"] = df["msa"].fillna("Unknown MSA")
+    df["region"] = df["msa"]
+
+    # MSA centroid = mean lat/lon of all constituent ZIPs
+    msa_centroids = (
+        df.groupby("region", dropna=False, observed=True)[["lat", "lon"]]
+          .mean()
+          .reset_index()
+    )
+    df = df.drop(columns=["lat", "lon"]).merge(msa_centroids, on="region", how="left")
+    group_cols = ["region", "lat", "lon", "cap_bin"]
+
 else:
-    # city centroids based on ZIP centroids
+    # City mode (also used as fallback if MSA selected but no file uploaded)
+    if agg_mode.startswith("MSA"):
+        st.warning("zip_to_msa.xlsx not found or could not be parsed. Showing City mode instead.")
     city_centroids = (
         df.groupby("region", dropna=False, observed=True)[["lat", "lon"]]
           .mean()
@@ -460,15 +1229,6 @@ df_agg = df_agg.sort_values("cap_bin", ascending=True).copy()
 df_agg_all = df_agg.copy()   # <-- keep full aggregated set for dropdown + camera
 
 
-# use_px_clamp = st.sidebar.checkbox("Clamp bubble size on screen (px)", value=True)
-# if use_px_clamp:
-#     radius_min_px = st.sidebar.slider("Min radius on screen (px)", 0, 10, 1)
-#     radius_max_px = st.sidebar.slider("Max radius on screen (px)", 10, 200, 80)
-# else:
-#     radius_min_px = 0
-#     radius_max_px = 100000  # effectively off
-
-
 # =========================================================
 # Styling (METERS radii + pixel clamps)
 # =========================================================
@@ -479,7 +1239,8 @@ st.sidebar.header("Basemap Settings")
 base_style = st.sidebar.radio(
     "Basemap style",
     ["Light (Positron)", "Light (Voyager)", "Dark"],
-    index=0
+    index=0,
+    key="p_base_style",
 )
 
 if base_style == "Light (Positron)":
@@ -493,35 +1254,35 @@ else:
 with st.sidebar.expander("🗺 Map Boundaries & Labels", expanded=False):
 
     darken_states_overlay = st.checkbox(
-        "Darker state boundaries (overlay)", value=True
+        "Darker state boundaries (overlay)", value=True, key="p_darken_states"
     )
 
     state_border_width = st.slider(
         "State border thickness (px)",
         0.1, 2.0, 0.35,
-        step=0.25
+        step=0.25, key="p_border_width",
     )
 
     state_border_opacity = st.slider(
         "State border darkness",
         0.01, 1.0, 0.1,
-        step=0.05
+        step=0.05, key="p_border_opacity",
     )
 
     show_state_labels = st.checkbox(
-        "Show state labels (overlay)", value=False
+        "Show state labels (overlay)", value=False, key="p_show_labels"
     )
 
     state_label_size = st.slider(
         "State label size (px)",
         0.1, 10.0, 0.8,
-        step=0.1
+        step=0.1, key="p_label_size",
     )
 
     state_label_opacity = st.slider(
         "State label opacity",
         0.05, 1.0, 0.4,
-        step=0.05
+        step=0.05, key="p_label_opacity",
     )
 
 # ---------------------------------------------------------
@@ -529,12 +1290,12 @@ with st.sidebar.expander("🗺 Map Boundaries & Labels", expanded=False):
 # ---------------------------------------------------------
 st.sidebar.header("Bubble Settings")
 
-show_outlines = st.sidebar.checkbox("Show bubble outlines", value=True)
-fill_opacity = st.sidebar.slider("Bubble opacity", 0.05, 1.0, 0.20, step=0.05)
-outline_width = st.sidebar.slider("Bubble outline width (px)", 0, 6, 2)
+show_outlines    = st.sidebar.checkbox("Show bubble outlines", value=True, key="p_show_outlines")
+fill_opacity     = st.sidebar.slider("Bubble opacity", 0.05, 1.0, 0.20, step=0.05, key="p_fill_opacity")
+outline_width    = st.sidebar.slider("Bubble outline width (px)", 0, 6, 2, key="p_outline_width")
 
 # optional declutter
-min_ids_to_show = st.sidebar.slider("Hide groups with # of records < ", 1, 20, 1)
+min_ids_to_show  = st.sidebar.slider("Hide groups with # of records < ", 1, 20, 1, key="p_min_ids")
 df_agg = df_agg[df_agg["n_ids"] >= min_ids_to_show].copy()
 
 # ---------------------------------------------------------
@@ -542,30 +1303,30 @@ df_agg = df_agg[df_agg["n_ids"] >= min_ids_to_show].copy()
 # ---------------------------------------------------------
 st.sidebar.header("Zoom-in Settings")
 
-zoom_in_mode = st.sidebar.checkbox("Zoom in mode", value=False)
+zoom_in_mode = st.sidebar.checkbox("Zoom in mode", value=False, key="p_zoom_in_mode")
 
 # When Zoom in mode is ON, force radii to minimum possible values
 if zoom_in_mode:
     min_px = 0.0   # minimum of slider range
     max_px = 1.0   # minimum of slider range
-    # show the sliders but lock them (optional; you can also hide them)
+    # show the sliders but lock them
     st.sidebar.slider("Min radius (px)", 0.0, 1.0, min_px, step=0.1, disabled=True)
     st.sidebar.slider("Max radius (px)", 1.0, 10.0, max_px, step=0.5, disabled=True)
 else:
-    min_px = st.sidebar.slider("Min radius (px)", 0.0, 1.0, 0.3, step=0.1)
-    max_px = st.sidebar.slider("Max radius (px)", 1.0, 10.0, 2.0, step=0.5)
+    min_px = st.sidebar.slider("Min radius (px)", 0.0, 1.0, 0.3, step=0.1, key="p_min_px")
+    # Clamp any loaded max_px to be above min_px before the slider renders
+    if "p_max_px" in st.session_state:
+        st.session_state["p_max_px"] = max(float(st.session_state["p_max_px"]), float(min_px) + 0.5)
+    # Max radius lower bound is always at least min_px + one step above it
+    max_px = st.sidebar.slider("Max radius (px)", min_px + 0.5, 10.0, max(2.0, min_px + 0.5), step=0.5, key="p_max_px")
 
-# ✅ Warning if user crosses the limit (still useful when not locked)
-if min_px >= max_px:
-    st.sidebar.warning(
-        "⚠️ Min radius must stay smaller than Max radius. "
-        "Please lower Min or increase Max."
-    )
+# Hard clamp: guarantee max_px is strictly greater than min_px at all times
+max_px = max(max_px, min_px + 0.1)
 
 # Controls how much of the total radius range is used by the first 1..pivot IDs
-alpha = st.sidebar.slider("Small-ID emphasis", 0.01, 0.10, 0.01, step=0.01)
-pivot = st.sidebar.slider("Pivot # (slow growth after n=)", 1, 200, 5)
-k_post = st.sidebar.slider("Post-pivot saturation \n (damp big bubbles)", 50, 800, 50)
+alpha  = st.sidebar.slider("Small-ID emphasis", 0.01, 0.10, 0.01, step=0.01, key="p_alpha")
+pivot  = st.sidebar.slider("Pivot # (slow growth after n=)", 1, 200, 5, key="p_pivot")
+k_post = st.sidebar.slider("Post-pivot saturation \n (damp big bubbles)", 50, 800, 50, key="p_k_post")
 
 # # Damping > 1 makes post-pivot growth even slower
 # gamma_post = st.sidebar.slider("Post-pivot damping (Impact Big Bubbles)", 1.0, 6.0, 1.0, step=0.25)
@@ -589,6 +1350,48 @@ df_agg["radius_px"] = min_px + t * (max_px - min_px)
 df_agg = df_agg.sort_values("radius_px", ascending=False).copy()
 
 
+
+# =========================================================
+# ⚙️  Save / Load Settings
+# =========================================================
+st.sidebar.markdown("---")
+st.sidebar.header("⚙️ Save / Load Settings")
+
+# Keys that participate in save/load
+_PARAM_KEYS = [
+    "p_agg_mode", "p_base_style",
+    "p_darken_states", "p_border_width", "p_border_opacity",
+    "p_show_labels", "p_label_size", "p_label_opacity",
+    "p_show_outlines", "p_fill_opacity", "p_outline_width",
+    "p_min_ids", "p_zoom_in_mode", "p_min_px", "p_max_px",
+    "p_alpha", "p_pivot", "p_k_post",
+    "p_state_filter", "p_bins_selected", "p_top_n",
+]
+
+def _build_params_json() -> bytes:
+    """Serialise all current widget values to a JSON byte-string."""
+    params = {}
+    for _k in _PARAM_KEYS:
+        if _k in st.session_state:
+            _v = st.session_state[_k]
+            if hasattr(_v, "item"):                    # numpy scalar → Python native
+                _v = _v.item()
+            elif isinstance(_v, list):
+                _v = [x.item() if hasattr(x, "item") else x for x in _v]
+            params[_k] = _v
+    return json.dumps({"version": 1, "params": params}, indent=2).encode("utf-8")
+
+_settings_stem = Path(uploaded.name).stem
+st.sidebar.download_button(
+    "💾 Save current settings",
+    data=_build_params_json(),
+    file_name=f"{_settings_stem}_settings.json",
+    mime="application/json",
+    key="save_params_btn",
+)
+st.sidebar.file_uploader(
+    "📂 Load settings (.json)", type=["json"], key="params_file_uploader"
+)
 
 # =========================================================
 # Layout: Map + Top Regions
@@ -663,15 +1466,25 @@ with left:
     else:
         center_lat, center_lon, zoom = 39.5, -98.35, 3.3    
 
-    tooltip = {
-        "html": """
+    if agg_mode.startswith("ZIP"):
+        tooltip_html = """
         <div style="font-family: sans-serif;">
         <b>{region}</b><br/>
         ZIP: <b>{zip5}</b><br/>
         Capacity: {cap_bin}<br/>
         Records: <b>{n_ids}</b>
         </div>
-        """,
+        """
+    else:
+        tooltip_html = """
+        <div style="font-family: sans-serif;">
+        <b>{region}</b><br/>
+        Capacity: {cap_bin}<br/>
+        Records: <b>{n_ids}</b>
+        </div>
+        """
+    tooltip = {
+        "html": tooltip_html,
         "style": {"backgroundColor": "white", "color": "black"},
     }
 
@@ -747,23 +1560,66 @@ with left:
         layers.append(state_label_layer)
 
 
+    # For USA view, use the stored viewport (updated by user pan/zoom) as
+    # initial_view_state so the map does NOT visually reset to full-USA
+    # every time the user clicks "Process PNG" or changes a filter.
+    # On first load (store is None) we fall back to the Python-computed values.
+    if zoom_region == USA_OPTION:
+        _vs = _get_vp_store()
+        _iv_lat  = _vs["lat"]  if _vs["lat"]  is not None else float(center_lat)
+        _iv_lon  = _vs["lon"]  if _vs["lon"]  is not None else float(center_lon)
+        _iv_zoom = _vs["zoom"] if _vs["zoom"] is not None else float(zoom)
+    else:
+        _iv_lat, _iv_lon, _iv_zoom = float(center_lat), float(center_lon), float(zoom)
+
     deck = pdk.Deck(
         layers=layers,
-        initial_view_state=pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=zoom),
+        initial_view_state=pdk.ViewState(latitude=_iv_lat, longitude=_iv_lon, zoom=_iv_zoom),
         tooltip=tooltip,
         map_style=map_style,
         map_provider="mapbox",
     )
-    st.pydeck_chart(deck, use_container_width=True)
+
+    if zoom_region == USA_OPTION:
+        # Render via injected HTML so we can capture the interactive viewport.
+        # onViewStateChange fires on every pan/zoom and sends a fetch() beacon
+        # to the background server, updating the persistent _get_vp_store() dict.
+        _vp_port    = _start_vp_server()
+        _disp_html  = deck.to_html(as_string=True)
+        _disp_html  = _inject_vp_capture(_disp_html, _vp_port)
+        st.components.v1.html(_disp_html, height=520, scrolling=False)
+    else:
+        st.pydeck_chart(deck, use_container_width=True)
 
     # -----------------------------
     # One-click export (lazy render)
     # -----------------------------
     EXPORT_W, EXPORT_H, EXPORT_SCALE = 1400, 800, 2
+    import math as _math
+
+    # ── Compute export viewport ───────────────────────────────────────────────
+    if zoom_region == USA_OPTION:
+        # Use whatever viewport the user currently has on screen.
+        # _get_vp_store() is updated by the JS onViewStateChange beacon.
+        # Values are None until the user actually pans or zooms; fall back to
+        # the Python-computed initial_view_state in that case.
+        _vp = _get_vp_store()
+        exp_center_lat = _vp["lat"]  if _vp["lat"]  is not None else float(center_lat)
+        exp_center_lon = _vp["lon"]  if _vp["lon"]  is not None else float(center_lon)
+        _raw_zoom      = _vp["zoom"] if _vp["zoom"] is not None else float(zoom)
+        # +1.0 compensates for the export canvas being ~2× wider than the widget
+        # (log2(1400/700) = 1.0), keeping the same visible area.
+        exp_zoom_val   = _raw_zoom + 1.0
+    else:
+        # City / region view: viewport is already auto-computed from selected region
+        exp_center_lat = float(center_lat)
+        exp_center_lon = float(center_lon)
+        exp_zoom_val   = float(zoom)
 
     # Signature so we know when the map changed and the old export is stale
     map_signature = (
         zoom_region,
+        tuple(sorted(state_filter)),
         tuple(bins_selected),
         agg_mode,
         float(min_px), float(max_px),
@@ -776,7 +1632,7 @@ with left:
         bool(show_state_labels),
         float(state_label_size),
         float(state_label_opacity),
-        base_style,   # include anything else that changes appearance
+        base_style,
     )
 
     # If map changed, invalidate previously rendered PNG
@@ -789,17 +1645,31 @@ with left:
     with colA:
         if st.button("🔄 Process high-res PNG file", key="render_png_btn"):
             with st.spinner("Rendering high-res PNG..."):
-                deck_html = deck.to_html(as_string=True)
+                # exp_center_lat / exp_center_lon / exp_zoom_val already set above
+                # (either from the override controls or auto-computed)
+                deck_export = pdk.Deck(
+                    layers=layers,
+                    initial_view_state=pdk.ViewState(
+                        latitude=exp_center_lat,
+                        longitude=exp_center_lon,
+                        zoom=exp_zoom_val,
+                    ),
+                    tooltip=tooltip,
+                    map_style=map_style,
+                    map_provider="mapbox",
+                )
+                deck_export_html = deck_export.to_html(as_string=True)
                 st.session_state["export_png"] = render_deck_png_from_html(
-                    deck_html, EXPORT_W, EXPORT_H, EXPORT_SCALE
+                    deck_export_html, EXPORT_W, EXPORT_H, EXPORT_SCALE
                 )
 
     with colB:
         png_ready = st.session_state.get("export_png") is not None
+        _png_fname = f"{Path(uploaded.name).stem}_MAPS_PNG.png"
         st.download_button(
             "⬇️ Download PNG",
             data=st.session_state.get("export_png") or b"",
-            file_name="prospect_geo_map.png",
+            file_name=_png_fname,
             mime="image/png",
             disabled=not png_ready,
             key="download_png_btn",
@@ -814,7 +1684,7 @@ with left:
 
 with right:
     st.subheader("Top Regions (stacked by capacity bin)")
-    top_n = st.slider("How many regions", 5, 25, 10)
+    top_n = st.slider("How many regions", 5, 25, 10, key="p_top_n")
 
     if "region" in df_agg.columns:
         ctab = (
@@ -825,8 +1695,20 @@ with right:
 
         totals = ctab.groupby("region")["count"].sum().sort_values(ascending=False)
         keep_regions = totals.head(top_n).index.tolist()
-        ctab = ctab[ctab["region"].isin(keep_regions)].copy()
 
+        # ── Secondary exclusion: remove specific regions from the bar chart only ──
+        # (does NOT affect the interactive map or any other data)
+        with st.expander("Remove regions from bar chart only", expanded=False):
+            exclude_from_chart = st.multiselect(
+                "Select regions to hide from bar chart (map is unaffected)",
+                options=keep_regions,
+                default=[],
+                key="bar_chart_exclude",
+            )
+        if exclude_from_chart:
+            keep_regions = [r for r in keep_regions if r not in exclude_from_chart]
+
+        ctab = ctab[ctab["region"].isin(keep_regions)].copy()
         ctab["cap_bin"] = pd.Categorical(ctab["cap_bin"], categories=bin_order, ordered=True)
 
         fig = px.bar(
@@ -884,3 +1766,8 @@ with st.expander("Missing ZIP geocodes"):
         base[base["lat"].isna()][[id_col, zip_col, city_col, state_col]].head(50),
         use_container_width=True
     )
+
+
+# =========================================================
+
+_tab_dist.__exit__(None, None, None)
