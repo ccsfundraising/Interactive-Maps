@@ -1981,7 +1981,6 @@ def render_synced_deck(
     )
     _save_vp(state_key, vp)
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 US_STATES_GEOJSON_URL = "https://raw.githubusercontent.com/PublicaMundi/MappingAPI/master/data/geojson/us-states.json"
 
@@ -2745,7 +2744,6 @@ else:
                         _hm_deck,
                         state_key="hm_vp",
                         component_key="hm_deck",
-                        render_hash=_hm_render_hash,
                         height=520,
                     )
                     # ── Color legend bar ──────────────────────────────────────
@@ -3459,7 +3457,6 @@ with left:
             deck,
             state_key="main_vp",
             component_key="main_deck",
-            render_hash=_main_render_hash,
             height=520,
         )
     else:
