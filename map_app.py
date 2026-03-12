@@ -1527,38 +1527,80 @@ with left:
         "style": {"backgroundColor": "white", "color": "black"},
     }
 
-    fill_layer = pdk.Layer(
-    "ScatterplotLayer",
-    data=df_map,
-    get_position="[lon, lat]",
-    radius_units="pixels",
-    get_radius="radius_px",
-    filled=True,
-    stroked=False,
-    get_fill_color="fill_rgb",
-    pickable=True,
-    opacity=fill_opacity,
-    )
+    # fill_layer = pdk.Layer(
+    # "ScatterplotLayer",
+    # data=df_map,
+    # get_position="[lon, lat]",
+    # radius_units="pixels",
+    # get_radius="radius_px",
+    # filled=True,
+    # stroked=False,
+    # get_fill_color="fill_rgb",
+    # pickable=True,
+    # opacity=fill_opacity,
+    # )
 
 
-    layers = [fill_layer]
+    # layers = [fill_layer]
 
-    if show_outlines and outline_width > 0:
-        outline_layer = pdk.Layer(
-            "ScatterplotLayer",
-            data=df_map,
-            get_position="[lon, lat]",
-            radius_units="pixels",
-            get_radius="radius_px",
-            filled=False,
-            stroked=True,
-            get_line_color="line_rgb",
-            line_width_min_pixels=outline_width,
-            pickable=False,
-            opacity=1.0,
+    # if show_outlines and outline_width > 0:
+    #     outline_layer = pdk.Layer(
+    #         "ScatterplotLayer",
+    #         data=df_map,
+    #         get_position="[lon, lat]",
+    #         radius_units="pixels",
+    #         get_radius="radius_px",
+    #         filled=False,
+    #         stroked=True,
+    #         get_line_color="line_rgb",
+    #         line_width_min_pixels=outline_width,
+    #         pickable=False,
+    #         opacity=1.0,
+    #     )
+
+    #     layers.append(outline_layer)
+
+    layers = []
+
+    # draw lower-priority bins first, higher-priority bins last
+    # so higher-priority colors (like red) remain visible on top
+    for b in sorted(bin_order, key=parse_capacity_min):
+        df_bin = df_map[df_map["cap_bin"] == b].copy()
+        if df_bin.empty:
+            continue
+
+        # keep the existing bubble size logic exactly as-is
+        layers.append(
+            pdk.Layer(
+                "ScatterplotLayer",
+                data=df_bin,
+                get_position="[lon, lat]",
+                radius_units="pixels",
+                get_radius="radius_px",
+                filled=True,
+                stroked=False,
+                get_fill_color="fill_rgb",
+                pickable=True,
+                opacity=fill_opacity,
+            )
         )
 
-        layers.append(outline_layer)
+        if show_outlines and outline_width > 0:
+            layers.append(
+                pdk.Layer(
+                    "ScatterplotLayer",
+                    data=df_bin,
+                    get_position="[lon, lat]",
+                    radius_units="pixels",
+                    get_radius="radius_px",
+                    filled=False,
+                    stroked=True,
+                    get_line_color="line_rgb",
+                    line_width_min_pixels=outline_width,
+                    pickable=False,
+                    opacity=1.0,
+                )
+            )
 
     if darken_states_overlay:
         states_geo = load_us_states_geojson()
@@ -1588,9 +1630,9 @@ with left:
             data=labels_df,
             get_position="[lon, lat]",
             get_text="label",
-            get_size=state_label_size,                 # ✅ knob works
+            get_size=state_label_size,                 # knob works
             size_units="pixels",
-            get_color=[80, 80, 80, alpha],             # ✅ opacity knob works (RGBA)
+            get_color=[80, 80, 80, alpha],             # opacity knob works (RGBA)
             get_outline_color=[255, 255, 255, alpha],  # keep halo consistent
             outline_width=3,
             billboard=True,
