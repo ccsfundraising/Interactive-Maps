@@ -1871,6 +1871,9 @@ import os
 import re
 import hashlib
 import streamlit.components.v1 as components
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
 
 
 # ── Viewport capture: per-session state + V1 custom component ───────────────
@@ -1937,6 +1940,25 @@ function _vp_send(la,lo,z){
     return html
 
 
+def render_synced_deck(
+    deck: pdk.Deck,
+    *,
+    state_key: str,
+    component_key: str,
+    height: int = 520,
+):
+    html = _inject_vp_postmessage(deck.to_html(as_string=True), component_key)
+    vp = deck_with_state(
+        key=component_key,
+        html=html,
+        html_hash=hashlib.sha1(html.encode("utf-8")).hexdigest(),
+        height=height,
+        instance_id=component_key,
+        default=None,
+    )
+    _save_vp(state_key, vp)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 US_STATES_GEOJSON_URL = "https://raw.githubusercontent.com/PublicaMundi/MappingAPI/master/data/geojson/us-states.json"
 
@@ -1948,26 +1970,6 @@ deck_with_state = components.declare_component(
     "deck_with_state",
     path=str(_COMPONENT_DIR),
 )
-
-
-def render_synced_deck(
-    deck: pdk.Deck,
-    *,
-    state_key: str,
-    component_key: str,
-    render_sig,
-    height: int = 520,
-):
-    html = _inject_vp_postmessage(deck.to_html(as_string=True), component_key)
-    vp = deck_with_state(
-        key=component_key,
-        html=html,
-        html_hash=hashlib.sha1(repr(render_sig).encode("utf-8")).hexdigest(),
-        height=height,
-        instance_id=component_key,
-        default=None,
-    )
-    _save_vp(state_key, vp)
 
 # =========================================================
 # Helpers
@@ -2672,10 +2674,16 @@ else:
                     if _show_labels:
                         _hm_layers.append(_zip_label_layer)
 
+                    _hm_vp_key = f"hm_vp::{_hp['abbr']}::{_hp['msa']}"
+                    _hm_vs = _get_vp(_hm_vp_key)
+                    _hm_iv_lat = _hm_vs["lat"] if _hm_vs["lat"] is not None else _clat
+                    _hm_iv_lon = _hm_vs["lon"] if _hm_vs["lon"] is not None else _clon
+                    _hm_iv_zoom = _hm_vs["zoom"] if _hm_vs["zoom"] is not None else _czoom
+
                     _hm_deck = pdk.Deck(
                         layers=_hm_layers,
                         initial_view_state=pdk.ViewState(
-                            latitude=_clat, longitude=_clon, zoom=_czoom,
+                            latitude=_hm_iv_lat, longitude=_hm_iv_lon, zoom=_hm_iv_zoom,
                         ),
                         tooltip={
                             "html": (
@@ -2693,17 +2701,11 @@ else:
                         _hp["msa"] if _hp["msa"] != "— All ZIPs in state —"
                         else _hp["state"]
                     )
-                    _hm_sig = (
-                        _hp["abbr"], _hp["msa"], _hp["var_col"], _hp["cscale"],
-                        _hp["opacity"], _hp["border"], _hp["p_lo"], _hp["p_hi"], _hp["style"],
-                        bool(_show_labels), int(_lsz), len(_feats_out),
-                    )
                     st.subheader(f"{_hp['var_label']} — {_area_title}")
                     render_synced_deck(
                         _hm_deck,
-                        state_key="hm_vp",
+                        state_key=_hm_vp_key,
                         component_key="hm_deck",
-                        render_sig=_hm_sig,
                         height=520,
                     )
 
@@ -2743,6 +2745,10 @@ else:
                     _dl_stem   = f"census_heatmap_{_safe_area}_{_safe_var}"
 
                     # Invalidate cached PNG whenever the map parameters change
+                    _hm_sig = (
+                        _hp["abbr"], _hp["msa"], _hp["var_col"], _hp["cscale"],
+                        _hp["opacity"], _hp["border"], _hp["p_lo"], _hp["p_hi"], _hp["style"],
+                    )
                     if st.session_state.get("hm_export_sig") != _hm_sig:
                         st.session_state["hm_export_sig"] = _hm_sig
                         st.session_state["hm_export_png"] = None
@@ -2755,7 +2761,7 @@ else:
                                 # Use whatever viewport the user currently has on screen.
                                 # Falls back to the Python-computed initial view if the
                                 # user hasn't panned/zoomed yet.
-                                _hm_vp   = _get_vp("hm_vp")
+                                _hm_vp   = _get_vp(_hm_vp_key)
                                 _exp_lat  = _hm_vp["lat"]  if _hm_vp["lat"]  is not None else _clat
                                 _exp_lon  = _hm_vp["lon"]  if _hm_vp["lon"]  is not None else _clon
                                 _exp_zoom = _hm_vp["zoom"] if _hm_vp["zoom"] is not None else _czoom
@@ -3379,9 +3385,49 @@ with left:
     else:
         _iv_lat, _iv_lon, _iv_zoom = float(center_lat), float(center_lon), float(zoom)
 
-    # Signature so we know when the rendered map actually changed.
-    # This keeps the custom component stable across viewport-only reruns, but
-    # forces a real iframe refresh when the underlying map parameters change.
+    deck = pdk.Deck(
+        layers=layers,
+        initial_view_state=pdk.ViewState(latitude=_iv_lat, longitude=_iv_lon, zoom=_iv_zoom),
+        tooltip=tooltip,
+        map_style=map_style,
+        map_provider="mapbox",
+    )
+
+    if zoom_region == USA_OPTION:
+        render_synced_deck(
+            deck,
+            state_key="main_vp",
+            component_key="main_deck",
+            height=520,
+        )
+    else:
+        st.pydeck_chart(deck, use_container_width=True)
+
+    # -----------------------------
+    # One-click export (lazy render)
+    # -----------------------------
+    EXPORT_W, EXPORT_H, EXPORT_SCALE = 1400, 800, 2
+    import math as _math
+
+    # ── Compute export viewport ───────────────────────────────────────────────
+    if zoom_region == USA_OPTION:
+        # Use whatever viewport the user currently has on screen.
+        # _get_vp_store() is updated by the JS onViewStateChange beacon.
+        # Values are None until the user actually pans or zooms; fall back to
+        # the Python-computed initial_view_state in that case.
+        _vp = _get_vp("main_vp")
+        exp_center_lat = _vp["lat"]  if _vp["lat"]  is not None else float(center_lat)
+        exp_center_lon = _vp["lon"]  if _vp["lon"]  is not None else float(center_lon)
+        _raw_zoom      = _vp["zoom"] if _vp["zoom"] is not None else float(zoom)
+        # +0.4 keeps the export framing closer to the on-screen widget view.
+        exp_zoom_val   = _raw_zoom + 0.4
+    else:
+        # City / region view: viewport is already auto-computed from selected region
+        exp_center_lat = float(center_lat)
+        exp_center_lon = float(center_lon)
+        exp_zoom_val   = float(zoom)
+
+    # Signature so we know when the map changed and the old export is stale
     map_signature = (
         zoom_region,
         tuple(sorted(state_filter)),
@@ -3399,49 +3445,6 @@ with left:
         float(state_label_opacity),
         base_style,
     )
-
-    deck = pdk.Deck(
-        layers=layers,
-        initial_view_state=pdk.ViewState(latitude=_iv_lat, longitude=_iv_lon, zoom=_iv_zoom),
-        tooltip=tooltip,
-        map_style=map_style,
-        map_provider="mapbox",
-    )
-
-    if zoom_region == USA_OPTION:
-        render_synced_deck(
-            deck,
-            state_key="main_vp",
-            component_key="main_deck",
-            render_sig=map_signature,
-            height=520,
-        )
-    else:
-        st.pydeck_chart(deck, use_container_width=True)
-
-    # -----------------------------
-    # One-click export (lazy render)
-    # -----------------------------
-    EXPORT_W, EXPORT_H, EXPORT_SCALE = 1400, 800, 2
-    import math as _math
-
-    # ── Compute export viewport ───────────────────────────────────────────────
-    if zoom_region == USA_OPTION:
-        # Use whatever viewport the user currently has on screen.
-        # Values are None until the user actually pans or zooms; fall back to
-        # the Python-computed initial_view_state in that case.
-        _vp = _get_vp("main_vp")
-        exp_center_lat = _vp["lat"]  if _vp["lat"]  is not None else float(center_lat)
-        exp_center_lon = _vp["lon"]  if _vp["lon"]  is not None else float(center_lon)
-        _raw_zoom      = _vp["zoom"] if _vp["zoom"] is not None else float(zoom)
-        # +1.0 compensates for the export canvas being ~2× wider than the widget
-        # (log2(1400/700) = 1.0), keeping the same visible area.
-        exp_zoom_val   = _raw_zoom + 0.4
-    else:
-        # City / region view: viewport is already auto-computed from selected region
-        exp_center_lat = float(center_lat)
-        exp_center_lon = float(center_lon)
-        exp_zoom_val   = float(zoom)
 
     # If map changed, invalidate previously rendered PNG
     if st.session_state.get("export_signature") != map_signature:
