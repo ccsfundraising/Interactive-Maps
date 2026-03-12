@@ -1898,6 +1898,14 @@ def _save_vp(key: str, vp) -> None:
         return
     st.session_state[f"_viewport_{key}"] = {"lat": lat, "lon": lon, "zoom": zoom}
 
+def _stable_component_hash(parts) -> str:
+    """
+    Hash only the inputs that should force the iframe to reload.
+    Excludes live viewport values so pan/zoom does not cause remount loops.
+    """
+    return hashlib.sha1(
+        json.dumps(parts, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
 
 def _inject_vp_postmessage(html: str, instance_id: str) -> str:
     """
@@ -1945,13 +1953,14 @@ def render_synced_deck(
     *,
     state_key: str,
     component_key: str,
+    render_hash: str,
     height: int = 520,
 ):
     html = _inject_vp_postmessage(deck.to_html(as_string=True), component_key)
     vp = deck_with_state(
         key=component_key,
         html=html,
-        html_hash=hashlib.sha1(html.encode("utf-8")).hexdigest(),
+        html_hash=render_hash,
         height=height,
         instance_id=component_key,
         default=None,
@@ -2702,13 +2711,29 @@ else:
                         else _hp["state"]
                     )
                     st.subheader(f"{_hp['var_label']} — {_area_title}")
+                    _hm_render_hash = _stable_component_hash({
+                        "abbr": _hp["abbr"],
+                        "msa": _hp["msa"],
+                        "var_col": _hp["var_col"],
+                        "var_label": _hp["var_label"],
+                        "cscale": _hp["cscale"],
+                        "opacity": float(_hp["opacity"]),
+                        "border": bool(_hp["border"]),
+                        "show_labels": bool(_show_labels),
+                        "label_size": int(_lsz),
+                        "p_lo": int(_hp["p_lo"]),
+                        "p_hi": int(_hp["p_hi"]),
+                        "style": _hp["style"],
+                        "feature_count": len(_feats_out),
+                    })
+                    
                     render_synced_deck(
                         _hm_deck,
-                        state_key=_hm_vp_key,
+                        state_key="hm_vp",
                         component_key="hm_deck",
+                        render_hash=_hm_render_hash,
                         height=520,
                     )
-
                     # ── Color legend bar ──────────────────────────────────────
                     _N = 7
                     _legend_html = (
@@ -3394,10 +3419,33 @@ with left:
     )
 
     if zoom_region == USA_OPTION:
+        _main_render_hash = _stable_component_hash({
+            "zoom_region": zoom_region,
+            "state_filter": tuple(sorted(state_filter)),
+            "bins_selected": tuple(bins_selected),
+            "agg_mode": agg_mode,
+            "min_px": float(min_px),
+            "max_px": float(max_px),
+            "fill_opacity": float(fill_opacity),
+            "outline_width": int(outline_width),
+            "show_outlines": bool(show_outlines),
+            "darken_states_overlay": bool(darken_states_overlay),
+            "state_border_width": float(state_border_width),
+            "state_border_opacity": float(state_border_opacity),
+            "show_state_labels": bool(show_state_labels),
+            "state_label_size": float(state_label_size),
+            "state_label_opacity": float(state_label_opacity),
+            "base_style": base_style,
+            "min_ids_to_show": int(min_ids_to_show),
+            "top_n_map": int(top_n_map),
+            "map_rows": len(df_map),
+        })
+    
         render_synced_deck(
             deck,
             state_key="main_vp",
             component_key="main_deck",
+            render_hash=_main_render_hash,
             height=520,
         )
     else:
