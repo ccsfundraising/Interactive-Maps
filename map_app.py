@@ -1690,7 +1690,7 @@ with left:
         _raw_zoom      = _vp["zoom"] if _vp["zoom"] is not None else float(zoom)
         # +1.0 compensates for the export canvas being ~2× wider than the widget
         # (log2(1400/700) = 1.0), keeping the same visible area.
-        exp_zoom_val   = _raw_zoom + 1.0
+        exp_zoom_val   = _raw_zoom + 0.4
     else:
         # City / region view: viewport is already auto-computed from selected region
         exp_center_lat = float(center_lat)
