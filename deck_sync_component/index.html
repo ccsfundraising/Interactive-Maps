@@ -1,0 +1,96 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>deck_sync_component</title>
+    <style>
+      html, body, #root {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        overflow: hidden;
+      }
+      iframe {
+        width: 100%;
+        border: 0;
+        display: block;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script>
+      const COMPONENT_READY = "streamlit:componentReady";
+      const SET_COMPONENT_VALUE = "streamlit:setComponentValue";
+      const SET_FRAME_HEIGHT = "streamlit:setFrameHeight";
+      const RENDER_EVENT = "streamlit:render";
+
+      const root = document.getElementById("root");
+      let innerFrame = null;
+      let currentArgs = {};
+      let lastHtmlHash = null;
+      let lastViewportJson = null;
+
+      function send(type, payload) {
+        window.parent.postMessage(
+          Object.assign({ isStreamlitMessage: true, type: type }, payload || {}),
+          "*"
+        );
+      }
+
+      function setFrameHeight(height) {
+        send(SET_FRAME_HEIGHT, { height: height });
+      }
+
+      function setComponentValue(value) {
+        send(SET_COMPONENT_VALUE, { value: value, dataType: "json" });
+      }
+
+      function ensureFrame(height) {
+        if (!innerFrame) {
+          innerFrame = document.createElement("iframe");
+          innerFrame.setAttribute("scrolling", "no");
+          root.appendChild(innerFrame);
+        }
+        innerFrame.style.height = `${height}px`;
+        document.body.style.height = `${height}px`;
+        setFrameHeight(height);
+        return innerFrame;
+      }
+
+      function render(args) {
+        currentArgs = args || {};
+        const height = Number(currentArgs.height || 520);
+        const frame = ensureFrame(height);
+        if (lastHtmlHash !== currentArgs.html_hash) {
+          frame.srcdoc = currentArgs.html || "";
+          lastHtmlHash = currentArgs.html_hash || null;
+        }
+      }
+
+      window.addEventListener("message", (event) => {
+        const data = event.data || {};
+
+        if (data.type === RENDER_EVENT) {
+          render(data.args || {});
+          return;
+        }
+
+        if (data.type === "deck_viewport") {
+          if (!currentArgs || data.instance_id !== currentArgs.instance_id) {
+            return;
+          }
+          const vp = data.viewport || null;
+          const vpJson = JSON.stringify(vp);
+          if (vpJson !== lastViewportJson) {
+            lastViewportJson = vpJson;
+            setComponentValue(vp);
+          }
+        }
+      });
+
+      send(COMPONENT_READY, { apiVersion: 1 });
+      setFrameHeight(520);
+    </script>
+  </body>
+</html>
