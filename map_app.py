@@ -1900,19 +1900,46 @@ def _save_vp(key: str, vp) -> None:
 
 def _viewport_agnostic_html_hash(html: str) -> str:
     """
-    Create a stable hash for the rendered deck HTML while ignoring only the
-    current viewport values. This prevents pan/zoom remount loops, but still
-    reloads the iframe when real map settings/layers/toggles change.
+    Hash deck HTML while ignoring only viewport-related values so pan/zoom
+    does not remount the iframe, but real map/toggle/layer changes still do.
     """
     normalized = html
 
-    # Ignore only the live view-state numbers that change during pan/zoom.
-    normalized = re.sub(r'("latitude"\s*:\s*)-?\d+(\.\d+)?', r'\1__LAT__', normalized)
-    normalized = re.sub(r'("longitude"\s*:\s*)-?\d+(\.\d+)?', r'\1__LON__', normalized)
-    normalized = re.sub(r'("zoom"\s*:\s*)-?\d+(\.\d+)?', r'\1__ZOOM__', normalized)
+    # Match JSON style: "latitude": 39.5
+    normalized = re.sub(
+        r'(["\']latitude["\']\s*:\s*)-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?',
+        r'\1__LAT__',
+        normalized,
+    )
+    normalized = re.sub(
+        r'(["\']longitude["\']\s*:\s*)-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?',
+        r'\1__LON__',
+        normalized,
+    )
+    normalized = re.sub(
+        r'(["\']zoom["\']\s*:\s*)-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?',
+        r'\1__ZOOM__',
+        normalized,
+    )
+
+    # Match JS object style: latitude: 39.5
+    normalized = re.sub(
+        r'(\blatitude\s*:\s*)-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?',
+        r'\1__LAT__',
+        normalized,
+    )
+    normalized = re.sub(
+        r'(\blongitude\s*:\s*)-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?',
+        r'\1__LON__',
+        normalized,
+    )
+    normalized = re.sub(
+        r'(\bzoom\s*:\s*)-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?',
+        r'\1__ZOOM__',
+        normalized,
+    )
 
     return hashlib.sha1(normalized.encode("utf-8")).hexdigest()
-
 def _stable_component_hash(parts) -> str:
     """
     Hash only the inputs that should force the iframe to reload.
