@@ -1898,6 +1898,21 @@ def _save_vp(key: str, vp) -> None:
         return
     st.session_state[f"_viewport_{key}"] = {"lat": lat, "lon": lon, "zoom": zoom}
 
+def _viewport_agnostic_html_hash(html: str) -> str:
+    """
+    Create a stable hash for the rendered deck HTML while ignoring only the
+    current viewport values. This prevents pan/zoom remount loops, but still
+    reloads the iframe when real map settings/layers/toggles change.
+    """
+    normalized = html
+
+    # Ignore only the live view-state numbers that change during pan/zoom.
+    normalized = re.sub(r'("latitude"\s*:\s*)-?\d+(\.\d+)?', r'\1__LAT__', normalized)
+    normalized = re.sub(r'("longitude"\s*:\s*)-?\d+(\.\d+)?', r'\1__LON__', normalized)
+    normalized = re.sub(r'("zoom"\s*:\s*)-?\d+(\.\d+)?', r'\1__ZOOM__', normalized)
+
+    return hashlib.sha1(normalized.encode("utf-8")).hexdigest()
+
 def _stable_component_hash(parts) -> str:
     """
     Hash only the inputs that should force the iframe to reload.
@@ -1953,14 +1968,13 @@ def render_synced_deck(
     *,
     state_key: str,
     component_key: str,
-    render_hash: str,
     height: int = 520,
 ):
     html = _inject_vp_postmessage(deck.to_html(as_string=True), component_key)
     vp = deck_with_state(
         key=component_key,
         html=html,
-        html_hash=render_hash,
+        html_hash=_viewport_agnostic_html_hash(html),
         height=height,
         instance_id=component_key,
         default=None,
