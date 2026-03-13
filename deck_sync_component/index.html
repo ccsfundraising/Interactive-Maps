@@ -24,28 +24,29 @@
       const SET_COMPONENT_VALUE = "streamlit:setComponentValue";
       const SET_FRAME_HEIGHT = "streamlit:setFrameHeight";
       const RENDER_EVENT = "streamlit:render";
-
+    
       const root = document.getElementById("root");
       let innerFrame = null;
       let currentArgs = {};
       let lastHtmlHash = null;
       let lastViewportJson = null;
-
+      let ignoreViewportUntil = 0;
+    
       function send(type, payload) {
         window.parent.postMessage(
           Object.assign({ isStreamlitMessage: true, type: type }, payload || {}),
           "*"
         );
       }
-
+    
       function setFrameHeight(height) {
         send(SET_FRAME_HEIGHT, { height: height });
       }
-
+    
       function setComponentValue(value) {
         send(SET_COMPONENT_VALUE, { value: value, dataType: "json" });
       }
-
+    
       function ensureFrame(height) {
         if (!innerFrame) {
           innerFrame = document.createElement("iframe");
@@ -57,38 +58,48 @@
         setFrameHeight(height);
         return innerFrame;
       }
-
+    
       function render(args) {
         currentArgs = args || {};
         const height = Number(currentArgs.height || 520);
         const frame = ensureFrame(height);
+    
         if (lastHtmlHash !== currentArgs.html_hash) {
           frame.srcdoc = currentArgs.html || "";
           lastHtmlHash = currentArgs.html_hash || null;
+    
+          // Prevent immediate echo from a freshly re-mounted iframe.
+          ignoreViewportUntil = Date.now() + 500;
         }
       }
-
+    
       window.addEventListener("message", (event) => {
         const data = event.data || {};
-
+    
         if (data.type === RENDER_EVENT) {
           render(data.args || {});
           return;
         }
-
+    
         if (data.type === "deck_viewport") {
           if (!currentArgs || data.instance_id !== currentArgs.instance_id) {
             return;
           }
+    
+          if (Date.now() < ignoreViewportUntil) {
+            return;
+          }
+    
           const vp = data.viewport || null;
           const vpJson = JSON.stringify(vp);
+    
           if (vpJson !== lastViewportJson) {
             lastViewportJson = vpJson;
             setComponentValue(vp);
           }
         }
       });
-
+    
       send(COMPONENT_READY, { apiVersion: 1 });
       setFrameHeight(520);
     </script>
